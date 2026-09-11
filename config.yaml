@@ -4,21 +4,19 @@ output_dir: clips
 show_preview: true
 save_annotated: false
 
-# Crop used only for AI inference. Clip output remains the original full frame.
-# Format: [x1, y1, x2, y2] in normalized full-frame coordinates.
+# Legacy single-view crop. v0.4 dual-view mode ignores this while court geometry exists.
 court_roi: [0.02, 0.16, 0.98, 0.99]
 
-# v0.3 court geometry.
+# Court geometry.
 # Points MUST be ordered: far_left, far_right, near_right, near_left.
 # Values are normalized [x, y] coordinates in the full video frame.
-# The default below is an approximation for the current broadcast sample.
 # Run tools/calibrate_zones.py for the exact camera/video angle.
 court_geometry:
   court_polygon:
-    - [0.38, 0.28]  # far-left back corner
-    - [0.69, 0.28]  # far-right back corner
-    - [0.87, 0.81]  # near-right back corner
-    - [0.20, 0.81]  # near-left back corner
+    - [0.38, 0.28]
+    - [0.69, 0.28]
+    - [0.87, 0.81]
+    - [0.20, 0.81]
 
   # Regulation service line is 3.0 m from the back wall.
   # 3.3 m gives the POC a little tolerance for bbox/pose noise.
@@ -52,8 +50,28 @@ recorder:
 tracking:
   device: auto
   tracker: bytetrack.yaml
-  conf: 0.30
   iou: 0.45
+  frame_stride: 2
+
+  # v0.4: process near and far court as separate crops with separate trackers.
+  # The far crop gets a lower detection threshold and larger inference size,
+  # because far-side players occupy far fewer source pixels.
+  dual_view: true
+  view_padding: 0.06
+  near_conf: 0.28
+  far_conf: 0.18
+  near_imgsz: 768
+  far_imgsz: 1024
+  max_det_per_view: 6
+
+  # Separate ID namespaces so the two ByteTrack instances never collide.
+  near_id_offset: 0
+  far_id_offset: 1000
+
+  # Debug only; set true to display the near/far AI-view boundaries.
+  show_view_split: false
+
+  # Legacy single-view fallback values.
+  conf: 0.30
   imgsz: 960
   max_det: 8
-  frame_stride: 2

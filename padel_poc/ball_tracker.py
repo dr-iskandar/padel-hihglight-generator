@@ -16,24 +16,16 @@ class BallObservation:
 
 
 class BallTracker:
-    """Pose-aware small-ball tracker for the portrait virtual camera.
+    """Conservative small-ball tracker for the portrait virtual camera.
 
-    v0.11 keeps the lightweight POC approach, but fixes the most common false
-    positive in the current sample: hands / wrists being selected as the ball.
+    v0.12 focuses on stability. The main failure in the current broadcast sample
+    is a moving hand/wrist being selected as the ball. This version therefore
+    adds explicit skin-colour suppression in addition to the optional pose-aware
+    wrist rejection, tighter size limits, trajectory continuity, and two-frame
+    confirmation before acquiring a brand-new track.
 
-    The tracker now combines:
-      - yellow/green + bright/white appearance;
-      - frame motion;
-      - small/compact-object geometry;
-      - predicted-position continuity;
-      - player bounding-box context;
-      - wrist/hand exclusion from YOLO pose;
-      - short confirmation before acquiring a completely new track.
-
-    Important: a ball can legitimately pass near a racket/hand at impact. Hand
-    rejection is therefore softened when the candidate also agrees with the
-    existing predicted ball trajectory. This avoids throwing away real impact
-    frames while strongly suppressing random moving hands during acquisition.
+    A learned ball detector is still the right production solution. This module
+    is deliberately a stronger POC fallback, not an attempt to replace one.
     """
 
     WRIST_INDICES = (9, 10)  # COCO left/right wrist
@@ -48,20 +40,30 @@ class BallTracker:
 
         self.motion_threshold = int(cfg.get("motion_threshold", 8))
         self.min_area = float(cfg.get("min_area", 1.0))
-        self.max_area = float(cfg.get("max_area", 110.0))
-        self.max_radius = float(cfg.get("max_radius", 8.5))
-        self.max_aspect_ratio = float(cfg.get("max_aspect_ratio", 2.5))
-        self.max_jump_ratio = float(cfg.get("max_jump_ratio", 0.20))
-        self.position_smoothing = float(cfg.get("position_smoothing", 0.78))
-        self.velocity_smoothing = float(cfg.get("velocity_smoothing", 0.62))
-        self.min_confidence = float(cfg.get("min_confidence", 0.27))
-        self.acquire_motion_fraction = float(cfg.get("acquire_motion_fraction", 0.020))
+        self.max_area = float(cfg.get("max_area", 90.0))
+        self.max_radius = float(cfg.get("max_radius", 7.5))
+        self.max_aspect_ratio = float(cfg.get("max_aspect_ratio", 2.35))
+        self.max_jump_ratio = float(cfg.get("max_jump_ratio", 0.18))
+        self.position_smoothing = float(cfg.get("position_smoothing", 0.80))
+        self.velocity_smoothing = float(cfg.get("velocity_smoothing", 0.64))
+        self.min_confidence = float(cfg.get("min_confidence", 0.29))
+        self.acquire_motion_fraction = float(cfg.get("acquire_motion_fraction", 0.022))
         self.tracked_motion_fraction = float(cfg.get("tracked_motion_fraction", 0.004))
         self.predict_frames = max(0, int(cfg.get("predict_frames", 3)))
-        self.reset_after_missed = max(1, int(cfg.get("reset_after_missed", 7)))
+        self.reset_after_missed = max(1, int(cfg.get("reset_after_missed", 6)))
         self.velocity_damping = float(cfg.get("velocity_damping", 0.86))
 
-        # Pose-aware rejection.
+        # Skin suppression. YCrCb ranges are intentionally broad; we use the
+        # fraction only as a penalty, not as a binary classifier.
+        self.skin_cr_min = int(cfg.get("skin_cr_min", 132))
+        self.skin_cr_max = int(cfg.get("skin_cr_max", 178))
+        self.skin_cb_min = int(cfg.get("skin_cb_min", 72))
+        self.skin_cb_max = int(cfg.get("skin_cb_max", 132))
+        self.skin_hard_fraction = float(cfg.get("skin_hard_fraction", 0.55))
+        self.skin_penalty_strength = float(cfg.get("skin_penalty_strength", 0.88))
+
+        # Optional pose-aware rejection. The current main loop can pass these
+        # arrays later without changing this API again.
         self.hand_keypoint_conf = float(cfg.get("hand_keypoint_conf", 0.28))
         self.hand_radius_ratio = float(cfg.get("hand_radius_ratio", 0.15))
         self.hand_radius_min_px = float(cfg.get("hand_radius_min_px", 14.0))
@@ -69,11 +71,8 @@ class BallTracker:
         self.person_inside_multiplier = float(cfg.get("person_inside_multiplier", 0.55))
         self.impact_allow_distance_px = float(cfg.get("impact_allow_distance_px", 28.0))
 
-        # A completely new track must be seen consistently twice. This stops a
-        # single moving fingertip / wrist highlight from instantly hijacking the
-        # portrait camera.
         self.acquire_confirm_frames = max(1, int(cfg.get("acquire_confirm_frames", 2)))
-        self.acquire_confirm_jump_ratio = float(cfg.get("acquire_confirm_jump_ratio", 0.075))
+        self.acquire_confirm_jump_ratio = float(cfg.get("acquire_confirm_jump_ratio", 0.060))
 
         self.court_polygon = court_polygon
         self.prev_gray: Optional[np.ndarray] = None
@@ -99,8 +98,8 @@ class BallTracker:
         return mask
 
     @staticmethod
-    def _motion_fraction(mask: np.ndarray, cx: float, cy: float, radius: float) -> float:
-        r = max(3, int(round(radius * 2.0)))
+    def _patch_fraction(mask: np.ndarray, cx: float, cy: float, radius: float, scale: float = 1.8) -> float:
+        r = max(3, int(round(radius * scale)))
         x1, x2 = max(0, int(cx) - r), min(mask.shape[1], int(cx) + r + 1)
         y1, y2 = max(0, int(cy) - r), min(mask.shape[0], int(cy) + r + 1)
         patch = mask[y1:y2, x1:x2]
@@ -124,6 +123,15 @@ class BallTracker:
         mask = cv2.bitwise_or(yellow, whiteish)
         return cv2.bitwise_and(mask, court_mask)
 
+    def _skin_mask(self, frame: np.ndarray, court_mask: np.ndarray) -> np.ndarray:
+        ycrcb = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
+        _, cr, cb = cv2.split(ycrcb)
+        cr_ok = cv2.inRange(cr, self.skin_cr_min, self.skin_cr_max)
+        cb_ok = cv2.inRange(cb, self.skin_cb_min, self.skin_cb_max)
+        skin = cv2.bitwise_and(cr_ok, cb_ok)
+        skin = cv2.medianBlur(skin, 3)
+        return cv2.bitwise_and(skin, court_mask)
+
     def _motion_mask(self, gray: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         if self.prev_gray is None:
             raw = np.zeros_like(gray)
@@ -141,7 +149,7 @@ class BallTracker:
 
     def _pose_context(self, player_boxes, keypoints_xy, keypoints_conf):
         boxes = []
-        hands = []  # (x, y, radius)
+        hands = []
         if player_boxes is None:
             return boxes, hands
 
@@ -174,8 +182,6 @@ class BallTracker:
         return x1 <= x <= x2 and y1 <= y <= y2
 
     def _context_multiplier(self, point: np.ndarray, predicted: Optional[np.ndarray], boxes, hands) -> float:
-        # A tracked ball that agrees with its predicted trajectory may be very
-        # close to the racket/hand during impact, so don't suppress it there.
         trajectory_agrees = False
         if predicted is not None:
             trajectory_agrees = float(np.linalg.norm(point - predicted)) <= self.impact_allow_distance_px
@@ -186,26 +192,16 @@ class BallTracker:
                 if math.hypot(float(point[0]) - hx, float(point[1]) - hy) <= radius:
                     multiplier *= self.hand_reject_multiplier
                     break
-
             if any(self._inside_box(point, box) for box in boxes):
                 multiplier *= self.person_inside_multiplier
         return float(multiplier)
-
-    @staticmethod
-    def _appearance_fraction(mask: np.ndarray, cx: float, cy: float, radius: float) -> float:
-        r = max(2, int(round(radius * 1.6)))
-        x1, x2 = max(0, int(cx) - r), min(mask.shape[1], int(cx) + r + 1)
-        y1, y2 = max(0, int(cy) - r), min(mask.shape[0], int(cy) + r + 1)
-        patch = mask[y1:y2, x1:x2]
-        if patch.size == 0:
-            return 0.0
-        return float(np.count_nonzero(patch)) / float(patch.size)
 
     def _candidate_score(
         self,
         contour,
         motion: np.ndarray,
         appearance: np.ndarray,
+        skin: np.ndarray,
         predicted: Optional[np.ndarray],
         diag: float,
         boxes,
@@ -223,45 +219,59 @@ class BallTracker:
 
         circle_area = math.pi * max(0.8, radius * radius)
         fill = min(1.0, area / circle_area)
-        if fill < 0.07:
+        if fill < 0.08:
             return -1.0, None
 
-        moving = self._motion_fraction(motion, cx, cy, radius)
+        moving = self._patch_fraction(motion, cx, cy, radius, scale=2.0)
         required_motion = self.tracked_motion_fraction if predicted is not None else self.acquire_motion_fraction
         if moving < required_motion:
             return -1.0, None
 
         point = np.asarray([cx, cy], dtype=np.float32)
         proximity = 0.45
+        dist_to_prediction = None
         if predicted is not None:
-            dist = float(np.linalg.norm(point - predicted))
-            max_jump = self.max_jump_ratio * diag * (1.0 + min(0.55, 0.14 * self.missed))
-            if dist > max_jump:
+            dist_to_prediction = float(np.linalg.norm(point - predicted))
+            max_jump = self.max_jump_ratio * diag * (1.0 + min(0.50, 0.12 * self.missed))
+            if dist_to_prediction > max_jump:
                 return -1.0, None
-            proximity = max(0.0, 1.0 - dist / max(1.0, max_jump))
+            proximity = max(0.0, 1.0 - dist_to_prediction / max(1.0, max_jump))
+
+        appearance_score = min(1.0, self._patch_fraction(appearance, cx, cy, radius, scale=1.6) * 2.4)
+        skin_fraction = self._patch_fraction(skin, cx, cy, radius, scale=1.5)
+
+        # On first acquisition, a strongly skin-coloured tiny blob is almost
+        # certainly a finger/hand highlight rather than a free-moving ball.
+        if predicted is None and skin_fraction >= self.skin_hard_fraction:
+            return -1.0, None
 
         compactness = min(1.0, fill * 1.35)
         motion_score = min(1.0, moving * 6.0)
-        appearance_score = min(1.0, self._appearance_fraction(appearance, cx, cy, radius) * 2.4)
-        # Padel ball is tiny in the broadcast footage. Prefer small blobs.
         size_score = 1.0 - min(1.0, max(0.0, radius - 0.8) / max(1.0, self.max_radius - 0.8))
 
         if predicted is None:
             score = (
-                0.34 * motion_score
+                0.35 * motion_score
                 + 0.22 * compactness
-                + 0.22 * appearance_score
+                + 0.23 * appearance_score
                 + 0.17 * size_score
-                + 0.05 * proximity
+                + 0.03 * proximity
             )
         else:
             score = (
-                0.50 * proximity
-                + 0.18 * motion_score
-                + 0.13 * compactness
-                + 0.11 * appearance_score
+                0.54 * proximity
+                + 0.17 * motion_score
+                + 0.11 * compactness
+                + 0.10 * appearance_score
                 + 0.08 * size_score
             )
+
+        # Skin penalty remains active while tracking, but is relaxed if the
+        # candidate lands very close to the predicted trajectory (possible hit).
+        trajectory_agrees = dist_to_prediction is not None and dist_to_prediction <= self.impact_allow_distance_px
+        if skin_fraction > 0.0:
+            strength = self.skin_penalty_strength * (0.35 if trajectory_agrees else 1.0)
+            score *= max(0.08, 1.0 - strength * min(1.0, skin_fraction * 1.8))
 
         score *= self._context_multiplier(point, predicted, boxes, hands)
         return float(score), point
@@ -300,12 +310,10 @@ class BallTracker:
 
         court_mask = self._court_mask(frame.shape)
         appearance = self._appearance_mask(hsv, court_mask)
+        skin = self._skin_mask(frame, court_mask)
         raw_motion, motion = self._motion_mask(gray)
         boxes, hands = self._pose_context(player_boxes, keypoints_xy, keypoints_conf)
 
-        # During acquisition require both appearance and motion. Once a track is
-        # established, appearance is enough because trajectory continuity becomes
-        # a much stronger cue than colour alone.
         candidate_mask = cv2.bitwise_and(appearance, motion) if self.last_pos is None else appearance
         contours, _ = cv2.findContours(candidate_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         predicted = self._predict()
@@ -317,6 +325,7 @@ class BallTracker:
                 contour,
                 raw_motion,
                 appearance,
+                skin,
                 predicted,
                 diag,
                 boxes,
@@ -328,11 +337,9 @@ class BallTracker:
 
         if best is None or best_score < self.min_confidence:
             self.missed += 1
-            if self.last_pos is None:
-                # Do not keep a stale one-frame hand candidate around forever.
-                if self.missed > 1:
-                    self._clear_pending()
-            # Continue a short trajectory through blur/occlusion.
+            if self.last_pos is None and self.missed > 1:
+                self._clear_pending()
+
             if self.last_pos is not None and self.missed <= self.predict_frames:
                 self.last_pos = (self.last_pos + self.velocity).astype(np.float32)
                 self.velocity = (self.velocity * self.velocity_damping).astype(np.float32)
@@ -345,7 +352,6 @@ class BallTracker:
                 self._clear_pending()
             return BallObservation(None if self.last_pos is None else tuple(map(float, self.last_pos)), 0.0, False)
 
-        # New tracks require short temporal confirmation. Established tracks don't.
         if self.last_pos is None and not self._confirm_acquisition(best, diag):
             self.missed = 0
             return BallObservation(None, 0.0, False)

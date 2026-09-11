@@ -19,11 +19,12 @@ class ActiveClip:
 
 
 class ClipRecorder:
-    """Buffered clip recorder with optional output-FPS resampling.
+    """Buffered clip recorder that preserves source playback speed by default.
 
-    `fps` is always the source-video FPS. `cfg.output_fps` controls the encoded
-    output FPS. When output_fps is lower than source FPS, frames are sampled by
-    source timestamps so clip duration stays correct instead of playing fast.
+    `fps` is always the source-video FPS. Unless `output_fps` is explicitly set
+    in config, the output uses the exact source FPS and writes every source
+    frame. This keeps highlights at normal speed; the system trims moments, it
+    does not speed them up.
     """
 
     def __init__(self, output_dir: str, fps: float, frame_size, cfg: dict):
@@ -31,9 +32,7 @@ class ClipRecorder:
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         self.fps = float(fps)
-        # 30 fps is the default social-video output. We resample by source time,
-        # so a 59.94 fps input still keeps exactly the same real-world duration.
-        requested_output_fps = float(cfg.get("output_fps", min(self.fps, 30.0)))
+        requested_output_fps = float(cfg.get("output_fps", self.fps))
         self.output_fps = max(1.0, min(self.fps, requested_output_fps))
         self.frame_size = tuple(map(int, frame_size))
         self.pre_frames = max(1, int(float(cfg.get("pre_roll_seconds", 3.0)) * self.fps))
@@ -54,6 +53,15 @@ class ClipRecorder:
     def _write_sampled(self, frame, frame_index: int):
         if self.active is None:
             return
+
+        # Exact-source-FPS mode: write every frame. This is the default and is
+        # intentionally the safest mode for highlight clips.
+        if abs(self.output_fps - self.fps) < 1e-3:
+            self.active.writer.write(frame)
+            self.active.last_output_slot += 1
+            return
+
+        # Optional downsampling still preserves real-world duration.
         slot = self._output_slot(frame_index, self.active.start_frame)
         if slot <= self.active.last_output_slot:
             return

@@ -1,36 +1,30 @@
-# Padel Auto-Highlight POC v0.5
+# Padel Auto-Highlight POC v0.6
 
 Edge POC:
 
-`Camera / RTSP / video -> dual-view pose + tracking -> court geometry -> serve state machine -> smart portrait reframe -> automatic MP4 clip`
+`Camera / RTSP / video -> dual-view pose + tracking -> court geometry -> serve state machine -> ball-guided smart portrait reframe -> automatic MP4 clip`
 
-## v0.5: Smart Portrait Reframe
+## v0.6: ball-guided composition, not ball-chasing
 
-The POC now creates a **9:16 portrait highlight** in addition to the original landscape clip.
+The portrait output now follows the **direction of play / ball**, but deliberately does **not** keep the ball glued to the exact center of the frame.
 
-The portrait output behaves like a virtual camera:
+The target behavior is closer to a human camera operator:
 
-- follows the most relevant player;
-- prioritizes `PREPARING`, `SWING`, and recent serve activity;
-- locks onto the detected server when a serve event fires;
-- smoothly pans instead of jumping between players;
-- smoothly zooms based on player size;
-- uses a dead-zone to reduce camera jitter;
-- keeps the original full-resolution landscape clip as an optional backup.
+- 9:16 portrait output;
+- mostly fixed zoom so the court composition stays readable;
+- vertical framing stays almost fixed;
+- ball primarily guides **left/right panning**;
+- a central ball safe-zone prevents tiny ball movements from moving the camera;
+- camera pan speed is capped, so a fast ball cannot make the crop whip across the frame;
+- ball guidance is blended with player positions to keep useful action context;
+- when the ball is briefly lost, the frame holds and then falls back to player/court composition;
+- detected server/player is a fallback, not the primary portrait target.
 
-Default portrait output:
+The built-in ball tracker is a lightweight classical-CV POC using yellow/green colour, motion, temporal proximity, and the calibrated playable-court mask. It is intentionally replaceable later by a learned ball detector.
 
-```text
-1080 x 1920
-clips/portrait/
-```
+### Portrait defaults
 
-A second preview window named **Portrait Output 9:16** is shown while the POC runs.
-The landscape preview also shows the current portrait crop rectangle.
-
-### Optional portrait tuning
-
-You do **not** need to edit `config.yaml` for portrait output to work. These are built-in defaults. Add a `portrait_output:` section only when you want to tune it:
+You do not need to change `config.yaml`; these defaults are built into the code. To tune them, add:
 
 ```yaml
 portrait_output:
@@ -41,38 +35,57 @@ portrait_output:
   show_preview: true
   show_source_crop: true
 
-  # Lower value = wider shot / more context.
-  # Higher value = tighter zoom on player.
-  subject_height_ratio: 0.38
+  # Keep zoom broad and stable, similar to the reference Shorts framing.
+  crop_height_ratio: 0.92
 
-  # Limits how far the virtual camera may zoom.
-  min_crop_height_ratio: 0.40
-  max_crop_height_ratio: 1.00
+  # Ball may move inside this central horizontal zone without moving camera.
+  ball_safezone_ratio: 0.20
 
-  # Motion smoothing. Increase for faster camera response.
-  center_smoothing: 0.20
-  zoom_smoothing: 0.14
+  # How strongly the ball influences horizontal framing vs player context.
+  ball_weight: 0.78
 
-  # Prevent tiny pose movements from making the crop shake.
-  deadzone_ratio: 0.06
+  # Smooth pan and hard cap on pan velocity.
+  pan_smoothing: 0.18
+  max_pan_speed_ratio: 0.85
 
-  # Keeps following the detected server after the serve event.
-  lock_seconds: 5.0
+  # Keep using the last ball position briefly through detector misses.
+  ball_hold_seconds: 0.55
+
+  # Slow return to player/court composition when ball is lost.
+  recenter_smoothing: 0.05
 ```
 
-If the framing is too tight, try:
+If the camera still feels too reactive:
 
 ```yaml
-subject_height_ratio: 0.30
-min_crop_height_ratio: 0.50
+ball_safezone_ratio: 0.25
+pan_smoothing: 0.12
+max_pan_speed_ratio: 0.60
 ```
 
-If the virtual camera follows too slowly:
+If it feels too slow:
 
 ```yaml
-center_smoothing: 0.30
-zoom_smoothing: 0.20
+ball_safezone_ratio: 0.16
+pan_smoothing: 0.24
+max_pan_speed_ratio: 1.10
 ```
+
+### Optional ball-tracker tuning
+
+```yaml
+ball_tracking:
+  enabled: true
+  hsv_lower: [18, 70, 105]
+  hsv_upper: [48, 255, 255]
+  motion_threshold: 14
+  min_area: 3
+  max_area: 220
+  max_radius: 14
+  min_confidence: 0.28
+```
+
+If the court/video uses a different ball colour or lighting, this HSV range is the first thing to tune.
 
 ## v0.4: better far-side player detection
 
@@ -144,23 +157,11 @@ python -m pip install -r requirements.txt
 python main.py --source padel.mp4
 ```
 
-Webcam:
-
-```bash
-python main.py --source 0
-```
-
-RTSP:
-
-```bash
-python main.py --source "rtsp://USER:PASSWORD@CAMERA_IP:554/stream"
-```
-
 Outputs:
 
 ```text
 clips/                 original landscape highlights
-clips/portrait/        9:16 following + zoom highlights
+clips/portrait/        9:16 ball-guided portrait highlights
 ```
 
 ## Serve detector sequence

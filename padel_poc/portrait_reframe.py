@@ -16,17 +16,22 @@ class FocusInfo:
 
 
 class SmartPortraitReframer:
-    """9:16 virtual camera guided primarily by the tracked ball.
+    """9:16 virtual camera for padel highlights.
 
-    v0.7 makes ball guidance authoritative while the ball is fresh. Players are
-    fallback/composition context only. The camera uses a small dead-zone and a
-    distance-aware pan rate so a ball crossing to the left/right actually pulls
-    the portrait crop with it without frame-to-frame jitter.
+    Priority order:
+      1. fresh ball position;
+      2. currently active/moving player;
+      3. court centre.
+
+    v0.8 intentionally avoids averaging all four players because that kept the
+    crop near the middle even when play moved hard left/right. A short server
+    lock is retained only for the serve transition; it cannot hold the camera
+    on the server for multiple seconds after the ball leaves.
     """
 
     STATE_SCORES = {
         "SWING": 7.0,
-        "COOLDOWN": 6.0,
+        "COOLDOWN": 5.5,
         "PREPARING": 5.0,
         "IN_ZONE": 2.5,
         "IDLE": 0.5,
@@ -50,19 +55,27 @@ class SmartPortraitReframer:
         self.crop_height_ratio = float(cfg.get("crop_height_ratio", 0.92))
         self.vertical_bias = float(cfg.get("vertical_bias", 0.02))
 
-        # Faster horizontal catch-up than v0.6, but still smoothed.
-        self.pan_smoothing = float(cfg.get("pan_smoothing", 0.34))
-        self.max_pan_speed_ratio = float(cfg.get("max_pan_speed_ratio", 1.80))
-        self.ball_safezone_ratio = float(cfg.get("ball_safezone_ratio", 0.10))
-        self.ball_weight = float(cfg.get("ball_weight", 0.96))
-        self.ball_min_confidence = float(cfg.get("ball_min_confidence", 0.24))
-        self.ball_hold_seconds = float(cfg.get("ball_hold_seconds", 0.18))
-        self.recenter_smoothing = float(cfg.get("recenter_smoothing", 0.045))
-        self.sticky_bonus = float(cfg.get("sticky_bonus", 1.25))
-        self.lock_seconds = float(cfg.get("lock_seconds", 2.0))
+        # Ball following should visibly move with the rally, not lag behind it.
+        self.pan_smoothing = float(cfg.get("pan_smoothing", 0.46))
+        self.max_pan_speed_ratio = float(cfg.get("max_pan_speed_ratio", 2.80))
+        self.ball_safezone_ratio = float(cfg.get("ball_safezone_ratio", 0.055))
+        self.ball_weight = float(cfg.get("ball_weight", 0.985))
+        self.ball_min_confidence = float(cfg.get("ball_min_confidence", 0.22))
+        self.ball_hold_seconds = float(cfg.get("ball_hold_seconds", 0.12))
+
+        # Fallback following should move toward one active player, not an average
+        # of all four players which artificially keeps the crop centred.
+        self.player_pan_smoothing = float(cfg.get("player_pan_smoothing", 0.18))
+        self.player_motion_weight = float(cfg.get("player_motion_weight", 5.0))
+        self.sticky_bonus = float(cfg.get("sticky_bonus", 0.75))
+        self.max_fallback_lock_seconds = float(cfg.get("max_fallback_lock_seconds", 0.45))
+        self.lock_seconds = float(cfg.get("lock_seconds", 0.45))
+        self.recenter_smoothing = float(cfg.get("recenter_smoothing", 0.035))
 
         self.court_polygon = court_polygon
         self.tracks: Dict[int, tuple[np.ndarray, object]] = {}
+        self.track_centers: Dict[int, np.ndarray] = {}
+        self.track_motion: Dict[int, float] = {}
         self.current_target: Optional[int] = None
         self.locked_target: Optional[int] = None
         self.lock_until_frame = -1
@@ -101,12 +114,38 @@ class SmartPortraitReframer:
         return min(self._max_valid_crop_height(), ratio * self.frame_h)
 
     def update_tracks(self, track_ids, boxes, statuses: dict):
-        self.tracks = {}
+        previous_centers = self.track_centers
+        new_tracks: Dict[int, tuple[np.ndarray, object]] = {}
+        new_centers: Dict[int, np.ndarray] = {}
+        new_motion: Dict[int, float] = {}
+
         for i, track_id in enumerate(track_ids):
             if i >= len(boxes):
                 break
-            status = statuses.get(int(track_id))
-            self.tracks[int(track_id)] = (np.asarray(boxes[i], dtype=np.float32), status)
+            track_id = int(track_id)
+            bbox = np.asarray(boxes[i], dtype=np.float32)
+            status = statuses.get(track_id)
+            x1, y1, x2, y2 = map(float, bbox)
+            center = np.asarray([0.5 * (x1 + x2), 0.5 * (y1 + y2)], dtype=np.float32)
+
+            prev = previous_centers.get(track_id)
+            if prev is None:
+                motion = 0.0
+            else:
+                displacement = float(np.linalg.norm(center - prev))
+                bbox_h = max(20.0, y2 - y1)
+                motion = min(3.0, displacement / bbox_h)
+
+            old_motion = self.track_motion.get(track_id, 0.0)
+            motion = 0.65 * old_motion + 0.35 * motion
+
+            new_tracks[track_id] = (bbox, status)
+            new_centers[track_id] = center
+            new_motion[track_id] = motion
+
+        self.tracks = new_tracks
+        self.track_centers = new_centers
+        self.track_motion = new_motion
 
     def update_ball(self, point: Optional[tuple[float, float]], confidence: float, frame_index: int, found: bool = True):
         if point is None:
@@ -118,7 +157,8 @@ class SmartPortraitReframer:
 
     def lock_target(self, track_id: int, frame_index: int, seconds: Optional[float] = None):
         self.locked_target = int(track_id)
-        duration = self.lock_seconds if seconds is None else float(seconds)
+        requested = self.lock_seconds if seconds is None else float(seconds)
+        duration = min(max(0.05, requested), max(0.05, self.max_fallback_lock_seconds))
         self.lock_until_frame = int(frame_index + max(1.0, duration * self.fps))
         self.current_target = int(track_id)
 
@@ -128,7 +168,9 @@ class SmartPortraitReframer:
         else:
             state = str(getattr(status, "state", "IDLE")).upper()
             confidence = float(getattr(status, "confidence", 0.0) or 0.0)
-            score = self.STATE_SCORES.get(state, 0.5) + 2.0 * confidence
+            score = self.STATE_SCORES.get(state, 0.5) + 1.3 * confidence
+
+        score += self.player_motion_weight * self.track_motion.get(track_id, 0.0)
         if track_id == self.current_target:
             score += self.sticky_bonus
         return score
@@ -137,8 +179,7 @@ class SmartPortraitReframer:
         if self.locked_target is not None:
             if frame_index <= self.lock_until_frame and self.locked_target in self.tracks:
                 return self.locked_target
-            if frame_index > self.lock_until_frame:
-                self.locked_target = None
+            self.locked_target = None
 
         if not self.tracks:
             self.current_target = None
@@ -150,19 +191,12 @@ class SmartPortraitReframer:
 
     def _player_anchor_x(self, frame_index: int) -> tuple[float, Optional[int]]:
         target_id = self._select_target(frame_index)
-        if not self.tracks:
+        if target_id is None or target_id not in self.tracks:
             return self._fallback_center()[0], target_id
 
-        centers, weights = [], []
-        for track_id, (bbox, status) in self.tracks.items():
-            x1, _, x2, _ = map(float, bbox)
-            centers.append(0.5 * (x1 + x2))
-            weights.append(max(0.5, self._score(track_id, status)))
-
-        centers_arr = np.asarray(centers, dtype=np.float32)
-        weights_arr = np.asarray(weights, dtype=np.float32)
-        anchor = float(np.sum(centers_arr * weights_arr) / max(1e-6, np.sum(weights_arr)))
-        return anchor, target_id
+        bbox, _ = self.tracks[target_id]
+        x1, _, x2, _ = map(float, bbox)
+        return 0.5 * (x1 + x2), target_id
 
     def _ball_is_fresh(self, frame_index: int) -> bool:
         hold_frames = max(1, int(round(self.ball_hold_seconds * self.fps)))
@@ -175,22 +209,20 @@ class SmartPortraitReframer:
 
         if self._ball_is_fresh(frame_index):
             ball_x = float(self.ball_point[0])
-            safe = max(16.0, self.ball_safezone_ratio * crop_w)
+            safe = max(10.0, self.ball_safezone_ratio * crop_w)
             delta = ball_x - self.center_x
 
             if abs(delta) <= safe:
                 ball_guided_x = self.center_x
             else:
-                # Keep the ball just inside the safe-zone edge rather than
-                # centering on every small movement.
                 ball_guided_x = ball_x - np.sign(delta) * safe
 
             weight = float(np.clip(self.ball_weight, 0.0, 1.0))
             desired = weight * ball_guided_x + (1.0 - weight) * player_x
             return float(desired), "BALL", target_id
 
-        if self.tracks:
-            return float(player_x), "PLAYERS", target_id
+        if target_id is not None:
+            return float(player_x), "PLAYER", target_id
         return float(fallback_x), "COURT", target_id
 
     def _smooth_pan(self, desired_x: float, mode: str):
@@ -198,15 +230,15 @@ class SmartPortraitReframer:
         error = desired_x - self.center_x
 
         if mode == "BALL":
-            # The further the ball is from the portrait centre, the stronger
-            # the catch-up. This fixes the previous case where the ball went
-            # left but the crop visually stayed near the middle.
-            distance_ratio = min(1.0, abs(error) / max(1.0, crop_w * 0.55))
-            alpha = self.pan_smoothing * (1.0 + 0.85 * distance_ratio)
-            speed_multiplier = 1.0 + 0.75 * distance_ratio
+            distance_ratio = min(1.0, abs(error) / max(1.0, crop_w * 0.40))
+            alpha = self.pan_smoothing * (1.0 + 0.65 * distance_ratio)
+            speed_multiplier = 1.15 + 1.10 * distance_ratio
+        elif mode == "PLAYER":
+            alpha = self.player_pan_smoothing
+            speed_multiplier = 0.72
         else:
             alpha = self.recenter_smoothing
-            speed_multiplier = 0.55
+            speed_multiplier = 0.45
 
         raw_step = alpha * error
         max_step = max(
@@ -223,10 +255,14 @@ class SmartPortraitReframer:
         cx = float(np.clip(self.center_x, half_w, self.frame_w - half_w))
         cy = float(np.clip(self.center_y, half_h, self.frame_h - half_h))
 
-        x1 = int(round(cx - half_w)); x2 = int(round(cx + half_w))
-        y1 = int(round(cy - half_h)); y2 = int(round(cy + half_h))
-        x1 = max(0, min(self.frame_w - 2, x1)); y1 = max(0, min(self.frame_h - 2, y1))
-        x2 = max(x1 + 2, min(self.frame_w, x2)); y2 = max(y1 + 2, min(self.frame_h, y2))
+        x1 = int(round(cx - half_w))
+        x2 = int(round(cx + half_w))
+        y1 = int(round(cy - half_h))
+        y2 = int(round(cy + half_h))
+        x1 = max(0, min(self.frame_w - 2, x1))
+        y1 = max(0, min(self.frame_h - 2, y1))
+        x2 = max(x1 + 2, min(self.frame_w, x2))
+        y2 = max(y1 + 2, min(self.frame_h, y2))
         return x1, y1, x2, y2
 
     def render(self, frame, frame_index: int):
@@ -252,8 +288,16 @@ class SmartPortraitReframer:
         x1, y1, x2, y2 = self.last_focus.crop_rect
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2, cv2.LINE_AA)
         label = f"PORTRAIT {self.last_focus.mode}"
-        cv2.putText(frame, label, (x1 + 5, max(20, y1 + 20)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+        cv2.putText(
+            frame,
+            label,
+            (x1 + 5, max(20, y1 + 20)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            color,
+            1,
+            cv2.LINE_AA,
+        )
 
         if self.last_focus.ball_point is not None and self.last_focus.mode == "BALL":
             bx, by = map(int, self.last_focus.ball_point)

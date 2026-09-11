@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from collections import defaultdict, deque
-from typing import Deque, Dict, Iterable, Optional
+from typing import Deque, Dict, Iterable, Optional, Sequence
 import math
 import numpy as np
 
@@ -63,8 +63,15 @@ class _TrackState:
 class ServeDetector:
     """POC serve detector based on a temporal state machine."""
 
-    def __init__(self, zones: Dict[str, Iterable[float]], cfg: dict, fps: float):
-        self.zones = {k: tuple(map(float, v)) for k, v in zones.items()}
+    def __init__(
+        self,
+        zones: Dict[str, Iterable],
+        cfg: dict,
+        fps: float,
+        court_polygon: Optional[Sequence[Sequence[float]]] = None,
+    ):
+        self.zones = {k: self._normalize_polygon(v) for k, v in zones.items()}
+        self.court_polygon = self._normalize_polygon(court_polygon) if court_polygon is not None else None
         self.fps = float(fps)
         self.min_kp_conf = float(cfg.get("min_keypoint_conf", 0.30))
         self.stationary_seconds = float(cfg.get("stationary_seconds", 0.35))
@@ -89,9 +96,49 @@ class ServeDetector:
         self.global_last_trigger = -10**9
 
     @staticmethod
-    def _inside_zone(px: float, py: float, zones: Dict[str, tuple]) -> Optional[str]:
-        for name, (x1, y1, x2, y2) in zones.items():
-            if x1 <= px <= x2 and y1 <= py <= y2:
+    def _normalize_polygon(values) -> tuple[tuple[float, float], ...]:
+        if values is None:
+            return tuple()
+        vals = list(values)
+        if len(vals) == 4 and all(isinstance(v, (int, float, np.integer, np.floating)) for v in vals):
+            x1, y1, x2, y2 = map(float, vals)
+            return ((x1, y1), (x2, y1), (x2, y2), (x1, y2))
+        polygon = []
+        for point in vals:
+            if len(point) != 2:
+                raise ValueError("Polygon points must be [x, y]")
+            polygon.append((float(point[0]), float(point[1])))
+        if len(polygon) < 3:
+            raise ValueError("A polygon needs at least 3 points")
+        return tuple(polygon)
+
+    @staticmethod
+    def _point_in_polygon(px: float, py: float, polygon) -> bool:
+        if not polygon:
+            return False
+        inside = False
+        n = len(polygon)
+        j = n - 1
+        eps = 1e-9
+        for i in range(n):
+            xi, yi = polygon[i]
+            xj, yj = polygon[j]
+            dx, dy = xj - xi, yj - yi
+            cross = (px - xi) * dy - (py - yi) * dx
+            if abs(cross) <= 1e-8:
+                dot = (px - xi) * (px - xj) + (py - yi) * (py - yj)
+                if dot <= eps:
+                    return True
+            intersects = ((yi > py) != (yj > py)) and (px < (xj - xi) * (py - yi) / ((yj - yi) + eps) + xi)
+            if intersects:
+                inside = not inside
+            j = i
+        return inside
+
+    @classmethod
+    def _inside_zone(cls, px: float, py: float, zones: Dict[str, tuple]) -> Optional[str]:
+        for name, polygon in zones.items():
+            if cls._point_in_polygon(px, py, polygon):
                 return name
         return None
 
@@ -232,7 +279,11 @@ class ServeDetector:
         center_y = 0.5 * (y1 + y2)
         foot_x = center_x / max(1.0, w)
         foot_y = y2 / max(1.0, h)
-        zone = self._inside_zone(foot_x, foot_y, self.zones)
+
+        if self.court_polygon is not None and not self._point_in_polygon(foot_x, foot_y, self.court_polygon):
+            zone = None
+        else:
+            zone = self._inside_zone(foot_x, foot_y, self.zones)
 
         track = self.tracks[track_id]
         track.last_seen = frame_index

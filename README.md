@@ -80,7 +80,7 @@ Saved clips appear in `clips/`.
 
 ## Dual-view tuning
 
-Default `config.yaml` settings:
+v0.4 has these built-in defaults. You can add any of them under the existing `tracking:` section in your local `config.yaml` to override them without re-calibrating the court:
 
 ```yaml
 tracking:

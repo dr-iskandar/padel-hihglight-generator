@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
-import math
 import cv2
 
 
@@ -15,29 +14,24 @@ class ActiveClip:
     start_frame: int
     end_frame: int
     hard_end_frame: int
-    last_output_slot: int = -1
 
 
 class ClipRecorder:
-    """Buffered highlight recorder.
+    """Buffered highlight recorder with strictly normal-speed output.
 
-    Normal-speed playback is the default and wins even if an old local config
-    still contains `output_fps: 30`. The system's job is to select a highlight,
-    not accelerate it. Set `preserve_source_speed: false` only when an explicit
-    frame-rate conversion is really desired.
+    Highlight selection must never change playback speed. Every source frame is
+    written exactly once and the output video uses the source FPS. Old config
+    values such as `output_fps` or `preserve_source_speed` are intentionally
+    ignored so a local config cannot accidentally create a sped-up clip.
     """
 
     def __init__(self, output_dir: str, fps: float, frame_size, cfg: dict):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        self.fps = float(fps)
-        self.preserve_source_speed = bool(cfg.get("preserve_source_speed", True))
-        if self.preserve_source_speed:
-            self.output_fps = self.fps
-        else:
-            requested_output_fps = float(cfg.get("output_fps", self.fps))
-            self.output_fps = max(1.0, min(self.fps, requested_output_fps))
+        # Hard rule for the POC: 1 source frame -> 1 output frame at source FPS.
+        self.fps = max(1.0, float(fps))
+        self.output_fps = self.fps
 
         self.frame_size = tuple(map(int, frame_size))
         self.pre_frames = max(1, int(float(cfg.get("pre_roll_seconds", 3.0)) * self.fps))
@@ -50,38 +44,26 @@ class ClipRecorder:
         self.active: Optional[ActiveClip] = None
         self.last_saved: Optional[Path] = None
 
-    def _output_slot(self, source_frame_index: int, start_frame: int) -> int:
-        elapsed_source_frames = max(0, int(source_frame_index) - int(start_frame))
-        elapsed_seconds = elapsed_source_frames / max(1e-6, self.fps)
-        return int(math.floor(elapsed_seconds * self.output_fps + 1e-9))
-
-    def _write_sampled(self, frame, frame_index: int):
+    def _write_frame(self, frame):
         if self.active is None:
             return
-
-        if self.preserve_source_speed or abs(self.output_fps - self.fps) < 1e-3:
-            self.active.writer.write(frame)
-            self.active.last_output_slot += 1
-            return
-
-        slot = self._output_slot(frame_index, self.active.start_frame)
-        if slot <= self.active.last_output_slot:
-            return
         self.active.writer.write(frame)
-        self.active.last_output_slot = slot
 
     def push(self, frame, frame_index: int):
         self.buffer.append((frame_index, frame.copy()))
 
         if self.active is not None:
-            self._write_sampled(frame, frame_index)
+            self._write_frame(frame)
             if frame_index >= self.active.end_frame or frame_index >= self.active.hard_end_frame:
                 self._finish()
 
     def trigger(self, frame_index: int, label: str = "serve") -> Path:
         if self.active is not None:
             requested_end = frame_index + self.post_frames
-            self.active.end_frame = min(self.active.hard_end_frame, max(self.active.end_frame, requested_end))
+            self.active.end_frame = min(
+                self.active.hard_end_frame,
+                max(self.active.end_frame, requested_end),
+            )
             return self.active.path
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
@@ -98,8 +80,8 @@ class ClipRecorder:
         end_frame = min(hard_end, max(min_end, requested_end))
 
         self.active = ActiveClip(writer, path, start_frame, end_frame, hard_end)
-        for buffered_index, buffered_frame in self.buffer:
-            self._write_sampled(buffered_frame, buffered_index)
+        for _, buffered_frame in self.buffer:
+            self._write_frame(buffered_frame)
         return path
 
     def _finish(self):

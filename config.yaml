@@ -1,0 +1,50 @@
+source: 0
+model: yolo11n-pose.pt
+output_dir: clips
+show_preview: true
+save_annotated: false
+
+# Crop used only for AI inference. Clip output remains the original full frame.
+# Format: [x1, y1, x2, y2] in normalized full-frame coordinates.
+# This default fits the current broadcast sample reasonably well; recalibrate for a real court.
+court_roi: [0.02, 0.16, 0.98, 0.99]
+
+# Service zones are tested using the player's FEET (bottom-center of bbox), not bbox center.
+# Keep them around the back/service areas only. Recalibrate with tools/calibrate_zones.py.
+serve_zones:
+  near_left:  [0.02, 0.58, 0.49, 0.98]
+  near_right: [0.51, 0.58, 0.98, 0.98]
+  far_left:   [0.18, 0.18, 0.49, 0.43]
+  far_right:  [0.51, 0.18, 0.82, 0.43]
+
+serve_detector:
+  min_keypoint_conf: 0.30
+  stationary_seconds: 0.35
+  stationary_speed_threshold: 0.65
+  prep_memory_seconds: 0.80
+  prep_wrist_torso_ratio: 0.35
+  swing_speed_threshold: 2.20
+  wrist_lookback_seconds: 0.16
+  body_lookback_seconds: 0.20
+  confirm_window_seconds: 0.65
+  forward_move_threshold: 0.08
+  require_forward_motion: true
+  cooldown_seconds: 6.0
+  global_cooldown_seconds: 5.0
+  stale_track_seconds: 2.0
+
+recorder:
+  pre_roll_seconds: 3.0
+  post_roll_seconds: 7.0
+  min_clip_seconds: 5.0
+  max_clip_seconds: 15.0
+  codec: mp4v
+
+tracking:
+  device: auto
+  tracker: bytetrack.yaml
+  conf: 0.30
+  iou: 0.45
+  imgsz: 960
+  max_det: 8
+  frame_stride: 2

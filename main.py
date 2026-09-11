@@ -12,10 +12,12 @@ from ultralytics import YOLO
 from padel_poc.config import load_config
 from padel_poc.serve_detector import ServeDetector, ServeStatus
 from padel_poc.clip_recorder import ClipRecorder
+from padel_poc.court_geometry import derive_service_zones, normalized_polygon_to_pixels
 
 
 SKELETON_COLOR = (0, 255, 255)
 ZONE_COLOR = (100, 220, 255)
+COURT_COLOR = (70, 255, 120)
 ROI_COLOR = (255, 180, 60)
 
 
@@ -48,22 +50,56 @@ def normalized_rect(rect, frame_shape):
 
 
 def draw_zones(frame, zones):
-    h, w = frame.shape[:2]
-    for name, vals in zones.items():
-        x1, y1, x2, y2 = vals
-        p1 = (int(x1 * w), int(y1 * h))
-        p2 = (int(x2 * w), int(y2 * h))
-        cv2.rectangle(frame, p1, p2, ZONE_COLOR, 2)
-        cv2.putText(frame, name, (p1[0] + 4, p1[1] + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, ZONE_COLOR, 2, cv2.LINE_AA)
+    for name, points in zones.items():
+        pts = normalized_polygon_to_pixels(points, frame.shape)
+        cv2.polylines(frame, [pts], True, ZONE_COLOR, 2, cv2.LINE_AA)
+        anchor = tuple(pts[0])
+        cv2.putText(
+            frame,
+            name,
+            (int(anchor[0]) + 4, max(20, int(anchor[1]) + 20)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            ZONE_COLOR,
+            2,
+            cv2.LINE_AA,
+        )
+
+
+def draw_court_polygon(frame, court_polygon):
+    if not court_polygon:
+        return
+    pts = normalized_polygon_to_pixels(court_polygon, frame.shape)
+    cv2.polylines(frame, [pts], True, COURT_COLOR, 2, cv2.LINE_AA)
+    cv2.putText(
+        frame,
+        "PLAYABLE COURT",
+        (int(pts[0][0]) + 6, max(22, int(pts[0][1]) - 8)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.52,
+        COURT_COLOR,
+        2,
+        cv2.LINE_AA,
+    )
 
 
 def draw_roi(frame, roi_px):
     x1, y1, x2, y2 = roi_px
     cv2.rectangle(frame, (x1, y1), (x2, y2), ROI_COLOR, 1)
-    cv2.putText(frame, "AI ROI", (x1 + 5, max(20, y1 + 20)), cv2.FONT_HERSHEY_SIMPLEX, 0.52, ROI_COLOR, 1, cv2.LINE_AA)
+    cv2.putText(
+        frame,
+        "AI ROI",
+        (x1 + 5, max(20, y1 + 20)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.52,
+        ROI_COLOR,
+        1,
+        cv2.LINE_AA,
+    )
 
 
 def map_result_to_full_frame(result, roi_px):
+    """Return boxes/keypoints in original full-frame coordinates."""
     x0, y0, _, _ = roi_px
     if result.boxes is None or result.keypoints is None or result.boxes.id is None:
         return [], np.empty((0, 4)), np.empty((0, 17, 2)), np.empty((0, 17))
@@ -103,11 +139,17 @@ def draw_player_status(frame, bbox, status: ServeStatus):
     meter_h = 6
     my = max(2, ty + 24)
     cv2.rectangle(frame, (tx, my), (tx + meter_w, my + meter_h), (80, 80, 80), -1)
-    cv2.rectangle(frame, (tx, my), (tx + int(meter_w * status.confidence), my + meter_h), state_color, -1)
+    cv2.rectangle(
+        frame,
+        (tx, my),
+        (tx + int(meter_w * status.confidence), my + meter_h),
+        state_color,
+        -1,
+    )
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Padel auto-highlight POC v0.2")
+    parser = argparse.ArgumentParser(description="Padel auto-highlight POC v0.3")
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--source", default=None, help="Override source: 0, file path, or RTSP URL")
     parser.add_argument("--no-preview", action="store_true")
@@ -138,7 +180,24 @@ def main():
     court_roi = cfg.get("court_roi", [0.0, 0.0, 1.0, 1.0])
     roi_px = normalized_rect(court_roi, frame.shape)
 
-    serve_detector = ServeDetector(cfg["serve_zones"], cfg.get("serve_detector", {}), fps)
+    geometry_cfg = cfg.get("court_geometry", {})
+    court_polygon = geometry_cfg.get("court_polygon")
+    if court_polygon:
+        serve_zones = derive_service_zones(
+            court_polygon,
+            service_depth_m=float(geometry_cfg.get("service_depth_m", 3.3)),
+            center_gap_m=float(geometry_cfg.get("center_gap_m", 0.0)),
+            side_inset_m=float(geometry_cfg.get("side_inset_m", 0.0)),
+        )
+    else:
+        serve_zones = cfg.get("serve_zones", {})
+
+    serve_detector = ServeDetector(
+        serve_zones,
+        cfg.get("serve_detector", {}),
+        fps,
+        court_polygon=court_polygon,
+    )
     recorder = ClipRecorder(cfg.get("output_dir", "clips"), fps, (w, h), cfg.get("recorder", {}))
 
     preview = bool(cfg.get("show_preview", True)) and not args.no_preview
@@ -156,6 +215,10 @@ def main():
     print(f"Source: {source}")
     print(f"Resolution: {w}x{h} @ {fps:.1f} fps")
     print(f"AI device: {device} | frame stride: {frame_stride} | tracker: {tracker_name}")
+    if court_polygon:
+        print("Court geometry: polygon + perspective-generated service zones")
+    else:
+        print("Court geometry: legacy serve zones (run tools/calibrate_zones.py)")
     print("Press Q or ESC to quit.")
 
     pending_frame = frame
@@ -220,7 +283,10 @@ def main():
 
                     if event is not None:
                         clip_path = recorder.trigger(frame_index, label=f"serve_t{event.track_id}")
-                        last_event_text = f"SERVE | T{event.track_id} | {event.zone} | {event.confidence:.0%} | {clip_path.name}"
+                        last_event_text = (
+                            f"SERVE | T{event.track_id} | {event.zone} | "
+                            f"{event.confidence:.0%} | {clip_path.name}"
+                        )
                         last_event_until = time.monotonic() + 2.5
                         print(last_event_text)
 
@@ -236,7 +302,8 @@ def main():
                         vis[ry1:ry2, rx1:rx2] = annotated_crop_this_frame
 
                 draw_roi(vis, roi_px)
-                draw_zones(vis, cfg["serve_zones"])
+                draw_court_polygon(vis, court_polygon)
+                draw_zones(vis, serve_zones)
 
                 for i, track_id in enumerate(last_ids):
                     if i >= len(last_boxes):
@@ -250,13 +317,34 @@ def main():
             fps_ema = inst if fps_ema == 0 else 0.90 * fps_ema + 0.10 * inst
 
             if preview:
-                status_line = f"LOOP {fps_ema:.1f} FPS | SRC {fps:.1f} | AI /{frame_stride} | {'RECORDING CLIP' if recorder.active else 'BUFFERING'}"
-                cv2.putText(vis, status_line, (18, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.68, (255, 255, 255), 2, cv2.LINE_AA)
+                status_line = (
+                    f"LOOP {fps_ema:.1f} FPS | SRC {fps:.1f} | "
+                    f"AI /{frame_stride} | {'RECORDING CLIP' if recorder.active else 'BUFFERING'}"
+                )
+                cv2.putText(
+                    vis,
+                    status_line,
+                    (18, 32),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.68,
+                    (255, 255, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
                 if time.monotonic() < last_event_until:
                     cv2.rectangle(vis, (10, 43), (min(w - 10, 920), 82), (0, 0, 0), -1)
-                    cv2.putText(vis, last_event_text, (18, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (0, 255, 255), 2, cv2.LINE_AA)
+                    cv2.putText(
+                        vis,
+                        last_event_text,
+                        (18, 70),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.58,
+                        (0, 255, 255),
+                        2,
+                        cv2.LINE_AA,
+                    )
 
-                cv2.imshow("Padel Highlight POC v0.2", vis)
+                cv2.imshow("Padel Highlight POC v0.3", vis)
                 key = cv2.waitKey(1) & 0xFF
                 if key in (27, ord("q"), ord("Q")):
                     break

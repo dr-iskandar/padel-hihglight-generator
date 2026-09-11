@@ -18,26 +18,29 @@ class BallObservation:
 class BallTracker:
     """Lightweight POC tracker for a yellow/green padel ball.
 
-    This is intentionally classical CV so the portrait reframer can be tested
-    without adding another neural network. It combines HSV colour, motion,
-    compactness and temporal proximity, and only searches inside the calibrated
-    playable court. A learned ball detector can replace this later without
-    changing the portrait-camera API.
+    The tracker combines colour, motion, compactness and temporal continuity.
+    v0.7 intentionally rejects nearly-static yellow objects (scoreboard/UI,
+    court branding, etc.) and resets stale tracks quickly so it can reacquire
+    the real ball elsewhere in the court.
     """
 
     def __init__(self, cfg: Optional[dict] = None, court_polygon: Optional[Sequence[Sequence[float]]] = None):
         cfg = cfg or {}
         self.hsv_lower = np.asarray(cfg.get("hsv_lower", [18, 70, 105]), dtype=np.uint8)
         self.hsv_upper = np.asarray(cfg.get("hsv_upper", [48, 255, 255]), dtype=np.uint8)
-        self.motion_threshold = int(cfg.get("motion_threshold", 14))
-        self.min_area = float(cfg.get("min_area", 3.0))
-        self.max_area = float(cfg.get("max_area", 220.0))
-        self.max_radius = float(cfg.get("max_radius", 14.0))
-        self.max_jump_ratio = float(cfg.get("max_jump_ratio", 0.30))
-        self.position_smoothing = float(cfg.get("position_smoothing", 0.55))
-        self.velocity_smoothing = float(cfg.get("velocity_smoothing", 0.45))
+        self.motion_threshold = int(cfg.get("motion_threshold", 12))
+        self.min_area = float(cfg.get("min_area", 2.0))
+        self.max_area = float(cfg.get("max_area", 180.0))
+        self.max_radius = float(cfg.get("max_radius", 12.0))
+        self.max_jump_ratio = float(cfg.get("max_jump_ratio", 0.42))
+        self.position_smoothing = float(cfg.get("position_smoothing", 0.72))
+        self.velocity_smoothing = float(cfg.get("velocity_smoothing", 0.55))
         self.acquire_requires_motion = bool(cfg.get("acquire_requires_motion", True))
-        self.min_confidence = float(cfg.get("min_confidence", 0.28))
+        self.require_motion_while_tracking = bool(cfg.get("require_motion_while_tracking", True))
+        self.acquire_min_motion = float(cfg.get("acquire_min_motion", 0.045))
+        self.track_min_motion = float(cfg.get("track_min_motion", 0.020))
+        self.min_confidence = float(cfg.get("min_confidence", 0.24))
+        self.reset_after_misses = max(1, int(cfg.get("reset_after_misses", 5)))
         self.court_polygon = court_polygon
 
         self.prev_gray: Optional[np.ndarray] = None
@@ -61,13 +64,20 @@ class BallTracker:
 
     @staticmethod
     def _motion_fraction(mask: np.ndarray, cx: float, cy: float, radius: float) -> float:
-        r = max(3, int(round(radius * 1.6)))
+        r = max(3, int(round(radius * 1.8)))
         x1, x2 = max(0, int(cx) - r), min(mask.shape[1], int(cx) + r + 1)
         y1, y2 = max(0, int(cy) - r), min(mask.shape[0], int(cy) + r + 1)
         patch = mask[y1:y2, x1:x2]
         if patch.size == 0:
             return 0.0
         return float(np.count_nonzero(patch)) / float(patch.size)
+
+    def _mark_miss(self) -> BallObservation:
+        self.missed += 1
+        if self.missed >= self.reset_after_misses:
+            self.last_pos = None
+            self.velocity[:] = 0.0
+        return BallObservation(None if self.last_pos is None else tuple(map(float, self.last_pos)), 0.0, False)
 
     def update(self, frame) -> BallObservation:
         h, w = frame.shape[:2]
@@ -97,32 +107,40 @@ class BallTracker:
             if area < self.min_area or area > self.max_area:
                 continue
             (cx, cy), radius = cv2.minEnclosingCircle(contour)
-            if radius < 1.0 or radius > self.max_radius:
+            if radius < 0.8 or radius > self.max_radius:
                 continue
+
             circle_area = math.pi * max(1.0, radius * radius)
             fill = min(1.0, area / circle_area)
-            if fill < 0.12:
+            if fill < 0.10:
                 continue
 
             moving = self._motion_fraction(motion, cx, cy, radius)
-            if self.last_pos is None and self.acquire_requires_motion and moving < 0.05:
+            min_motion = self.acquire_min_motion if self.last_pos is None else self.track_min_motion
+            if self.last_pos is None and self.acquire_requires_motion and moving < min_motion:
+                continue
+            if self.last_pos is not None and self.require_motion_while_tracking and moving < min_motion:
+                # Critical: prevents static yellow score graphics / branding from
+                # becoming the portrait-camera target.
                 continue
 
-            proximity = 0.5
+            proximity = 0.45
             if predicted is not None:
                 dist = math.hypot(cx - float(predicted[0]), cy - float(predicted[1]))
                 if dist > self.max_jump_ratio * diag:
                     continue
                 proximity = max(0.0, 1.0 - dist / max(1.0, self.max_jump_ratio * diag))
 
-            score = 0.35 * fill + 0.35 * min(1.0, moving * 4.0) + 0.30 * proximity
+            # Motion is deliberately the strongest cue. A truly moving tiny ball
+            # should outrank a large/static yellow UI element.
+            motion_score = min(1.0, moving * 5.0)
+            score = 0.18 * fill + 0.54 * motion_score + 0.28 * proximity
             if score > best_score:
                 best_score = score
                 best = np.asarray([cx, cy], dtype=np.float32)
 
         if best is None or best_score < self.min_confidence:
-            self.missed += 1
-            return BallObservation(None if self.last_pos is None else tuple(map(float, self.last_pos)), 0.0, False)
+            return self._mark_miss()
 
         if self.last_pos is None:
             new_pos = best

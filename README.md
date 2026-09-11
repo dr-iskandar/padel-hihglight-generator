@@ -1,19 +1,31 @@
-# Padel Auto-Highlight POC v0.3
+# Padel Auto-Highlight POC v0.4
 
 Edge POC:
 
-`Camera / RTSP / video -> pose + tracking -> court geometry -> serve state machine -> ring buffer -> automatic MP4 clip`
+`Camera / RTSP / video -> dual-view pose + tracking -> court geometry -> serve state machine -> ring buffer -> automatic MP4 clip`
 
-## v0.3: perspective court geometry
+## v0.4: better far-side player detection
 
-The old rectangular serve boxes are gone. The POC now uses one **4-point playable-court polygon** and generates all four serve zones from standard padel-court geometry using a perspective transform (homography).
+The camera view is now split into two independent AI crops:
 
-That gives us:
+- **near half court**
+- **far half court**
 
-- serve zones that have the **same perspective/shape as the court**;
-- automatic `near_left`, `near_right`, `far_left`, and `far_right` zones;
-- players whose feet are outside the playable court are rejected from the serve state machine;
-- one calibration instead of drawing four oversized rectangles manually.
+Each half uses its own YOLO pose instance + ByteTrack state. The far half receives a lower detection threshold and larger inference size, so distant players occupy much more of the AI input than when the full 1920px frame is processed at once.
+
+This improves far-side player/pose detection while keeping the saved highlight video in the original full-frame resolution.
+
+Other v0.4 changes:
+
+- independent near/far tracking ID namespaces;
+- detections are accepted only when the player's feet belong to the corresponding court half;
+- clean custom bbox/skeleton overlay instead of Ultralytics' large default labels;
+- optional debug overlay for near/far AI-view boundaries;
+- existing perspective service zones and playable-court filtering remain active.
+
+## Court geometry
+
+The POC uses one **4-point playable-court polygon** and generates all four serve zones from standard padel-court geometry using a perspective transform.
 
 The four court points must be clicked in this exact order:
 
@@ -31,30 +43,20 @@ python -m pip install -r requirements.txt
 
 ## Calibrate court + serve zones
 
-For every new camera angle, run this first:
+For every new camera angle, run:
 
 ```bash
-python tools/calibrate_zones.py --source padel.mp4 --seek 30
+python tools/calibrate_zones.py --source padel.mp4 --seek 0
 ```
 
-Click the four **playable floor/back-wall corners**, not the outside glass/support structure:
+Click:
 
 1. far-left back corner
 2. far-right back corner
 3. near-right back corner
 4. near-left back corner
 
-The preview immediately shows the derived perspective service zones. Press **Enter/Space** to save, **R** to reset, or **Q/Esc** to cancel.
-
-The regulation padel service line is 3 m from the back wall. For the POC, `service_depth_m` defaults to `3.3` to allow a little bbox/pose noise. Set it to `3.0` for exact regulation geometry.
-
-## Optional AI ROI
-
-The AI inference crop is still rectangular for speed, and is independent from the playable-court polygon:
-
-```bash
-python tools/calibrate_court_roi.py --source padel.mp4 --seek 30
-```
+Press **Enter/Space** to save, **R** to reset, or **Q/Esc** to cancel.
 
 ## Run
 
@@ -76,14 +78,49 @@ python main.py --source "rtsp://USER:PASSWORD@CAMERA_IP:554/stream"
 
 Saved clips appear in `clips/`.
 
+## Dual-view tuning
+
+Default `config.yaml` settings:
+
+```yaml
+tracking:
+  dual_view: true
+  frame_stride: 2
+  view_padding: 0.06
+  near_conf: 0.28
+  far_conf: 0.18
+  near_imgsz: 768
+  far_imgsz: 1024
+```
+
+If far players are still missed, try:
+
+```yaml
+far_conf: 0.15
+far_imgsz: 1280
+```
+
+If the Mac becomes too slow, first try:
+
+```yaml
+frame_stride: 3
+far_imgsz: 960
+```
+
+Set this to inspect the two AI regions:
+
+```yaml
+show_view_split: true
+```
+
 ## Serve detector sequence
 
 The heuristic temporal state machine remains:
 
 `IN_ZONE -> PREPARING -> SWING -> MOVE TOWARD NET -> SERVE`
 
-A person must now also have their **feet inside the playable court and inside a perspective service polygon** before entering that sequence.
+A person must have their **feet inside the playable court and inside a perspective service polygon** before entering that sequence.
 
 ## Current POC scope
 
-This version focuses on reliable spatial filtering + serve-triggered recording. Face search, social auto-crop, ball tracking, and a learned temporal serve classifier remain later stages.
+This version focuses on reliable spatial filtering, near/far player pose detection, and serve-triggered recording. Face search, social auto-crop, ball tracking, and a learned temporal serve classifier remain later stages.

@@ -19,6 +19,7 @@ from padel_poc.court_views import (
     polygon_to_crop_rect,
 )
 from padel_poc.portrait_reframe import SmartPortraitReframer
+from padel_poc.ball_tracker import BallTracker
 
 
 ZONE_COLOR = (100, 220, 255)
@@ -188,7 +189,7 @@ def draw_player_overlay(frame, bbox, keypoints_xy, keypoints_conf, status: Serve
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Padel auto-highlight POC v0.5")
+    parser = argparse.ArgumentParser(description="Padel auto-highlight POC v0.6")
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--source", default=None, help="Override source: 0, file path, or RTSP URL")
     parser.add_argument("--no-preview", action="store_true")
@@ -243,11 +244,15 @@ def main():
     save_landscape = bool(portrait_cfg.get("save_landscape", True))
     landscape_recorder = ClipRecorder(output_dir, fps, (w, h), recorder_cfg) if save_landscape else None
 
-    portrait_reframer = portrait_recorder = None
+    portrait_reframer = portrait_recorder = ball_tracker = None
+    ball_cfg = cfg.get("ball_tracking", {})
+    ball_tracking_enabled = bool(ball_cfg.get("enabled", True))
     if portrait_enabled:
         portrait_reframer = SmartPortraitReframer((w, h), fps, portrait_cfg, court_polygon=court_polygon)
         portrait_dir = str(portrait_cfg.get("output_dir", str(Path(output_dir) / "portrait")))
         portrait_recorder = ClipRecorder(portrait_dir, fps, portrait_reframer.output_size, recorder_cfg)
+        if ball_tracking_enabled:
+            ball_tracker = BallTracker(ball_cfg, court_polygon=court_polygon)
 
     preview = bool(cfg.get("show_preview", True)) and not args.no_preview
     portrait_preview = bool(portrait_cfg.get("show_preview", True)) and preview and portrait_enabled
@@ -267,7 +272,8 @@ def main():
         print(f"Near crop: {view_rects['near']} | imgsz={tracking.get('near_imgsz', 768)} | conf={tracking.get('near_conf', 0.28)}")
         print(f"Far crop:  {view_rects['far']} | imgsz={tracking.get('far_imgsz', 1024)} | conf={tracking.get('far_conf', 0.18)}")
     if portrait_enabled:
-        print(f"Portrait output: {portrait_reframer.output_size[0]}x{portrait_reframer.output_size[1]} -> {portrait_cfg.get('output_dir', str(Path(output_dir) / 'portrait'))}")
+        mode = "BALL-GUIDED COMPOSITION" if ball_tracker is not None else "PLAYER FALLBACK"
+        print(f"Portrait output: {portrait_reframer.output_size[0]}x{portrait_reframer.output_size[1]} | {mode}")
     print("Press Q or ESC to quit.")
 
     pending_frame = frame
@@ -325,10 +331,13 @@ def main():
             portrait_frame = None
             if portrait_enabled and portrait_reframer is not None:
                 portrait_reframer.update_tracks(last_ids, last_boxes, last_statuses)
+                if ball_tracker is not None:
+                    ball_obs = ball_tracker.update(raw_frame)
+                    portrait_reframer.update_ball(ball_obs.point, ball_obs.confidence,
+                                                  frame_index, found=ball_obs.found)
                 if pending_event is not None:
-                    post_roll = float(recorder_cfg.get("post_roll_seconds", 7.0))
-                    portrait_reframer.lock_target(pending_event.track_id, frame_index,
-                        seconds=max(post_roll + 1.0, portrait_reframer.lock_seconds))
+                    # Server lock is fallback only. Fresh ball guidance always has priority.
+                    portrait_reframer.lock_target(pending_event.track_id, frame_index, seconds=2.0)
                 portrait_frame = portrait_reframer.render(raw_frame, frame_index)
                 portrait_recorder.push(portrait_frame, frame_index)
 
@@ -373,7 +382,7 @@ def main():
                     cv2.rectangle(vis, (10, 43), (min(w - 10, 1180), 82), (0, 0, 0), -1)
                     cv2.putText(vis, last_event_text, (18, 70), cv2.FONT_HERSHEY_SIMPLEX,
                                 0.58, (0, 255, 255), 2, cv2.LINE_AA)
-                cv2.imshow("Padel Highlight POC v0.5", vis)
+                cv2.imshow("Padel Highlight POC v0.6", vis)
                 if portrait_preview and portrait_frame is not None:
                     preview_w = int(portrait_cfg.get("preview_width", 360))
                     preview_h = int(round(preview_w * portrait_reframer.output_size[1] / portrait_reframer.output_size[0]))

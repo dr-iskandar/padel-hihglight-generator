@@ -6,16 +6,25 @@ save_annotated: false
 
 # Crop used only for AI inference. Clip output remains the original full frame.
 # Format: [x1, y1, x2, y2] in normalized full-frame coordinates.
-# This default fits the current broadcast sample reasonably well; recalibrate for a real court.
 court_roi: [0.02, 0.16, 0.98, 0.99]
 
-# Service zones are tested using the player's FEET (bottom-center of bbox), not bbox center.
-# Keep them around the back/service areas only. Recalibrate with tools/calibrate_zones.py.
-serve_zones:
-  near_left:  [0.02, 0.58, 0.49, 0.98]
-  near_right: [0.51, 0.58, 0.98, 0.98]
-  far_left:   [0.18, 0.18, 0.49, 0.43]
-  far_right:  [0.51, 0.18, 0.82, 0.43]
+# v0.3 court geometry.
+# Points MUST be ordered: far_left, far_right, near_right, near_left.
+# Values are normalized [x, y] coordinates in the full video frame.
+# The default below is an approximation for the current broadcast sample.
+# Run tools/calibrate_zones.py for the exact camera/video angle.
+court_geometry:
+  court_polygon:
+    - [0.38, 0.28]  # far-left back corner
+    - [0.69, 0.28]  # far-right back corner
+    - [0.87, 0.81]  # near-right back corner
+    - [0.20, 0.81]  # near-left back corner
+
+  # Regulation service line is 3.0 m from the back wall.
+  # 3.3 m gives the POC a little tolerance for bbox/pose noise.
+  service_depth_m: 3.3
+  center_gap_m: 0.0
+  side_inset_m: 0.0
 
 serve_detector:
   min_keypoint_conf: 0.30

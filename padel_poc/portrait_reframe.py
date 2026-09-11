@@ -7,6 +7,8 @@ import math
 import cv2
 import numpy as np
 
+from padel_poc.trajectory_predictor import BallTrajectoryPredictor, TrajectoryPrediction
+
 
 @dataclass
 class FocusInfo:
@@ -14,17 +16,23 @@ class FocusInfo:
     crop_rect: tuple[int, int, int, int]
     mode: str = "COURT"
     ball_point: Optional[tuple[float, float]] = None
+    predicted_point: Optional[tuple[float, float]] = None
+    predicted_zone: str = "UNKNOWN"
+    prediction_confidence: float = 0.0
 
 
 class SmartPortraitReframer:
     """Stable 9:16 virtual camera for padel highlights.
 
-    v0.9 changes the framing philosophy from "chase the ball" to "keep the
-    action inside a safe frame". The crop stays still while the target remains
-    inside a broad horizontal safe-zone, then makes a slow eased pan only when
-    the ball / active player approaches an edge. Zoom is intentionally fixed.
+    v0.10 adds a short-horizon trajectory director. The portrait crop does not
+    chase every ball pixel. Instead, recent ball movement is projected into the
+    calibrated court, a LEFT/CENTER/RIGHT destination is predicted ~0.3 s ahead,
+    and the camera begins a slow glide only when that predicted action would
+    approach the portrait edge.
 
-    This produces a sports-highlight feel instead of a shaky speed-ramp feel.
+    This keeps the sports-highlight feel while still anticipating a serve,
+    smash, volley, rebound, or other clear direction change after the ball has
+    started moving on its new trajectory.
     """
 
     STATE_SCORES = {
@@ -50,18 +58,32 @@ class SmartPortraitReframer:
         self.output_h = max(320, int(cfg.get("height", 1920)))
         self.aspect = self.output_w / self.output_h
 
-        # Use the widest possible 9:16 crop by default. No dynamic zoom.
+        # Wide, fixed 9:16 crop. No dynamic zoom while rally is active.
         self.crop_height_ratio = float(cfg.get("crop_height_ratio", 1.0))
         self.vertical_bias = float(cfg.get("vertical_bias", 0.015))
 
         # Stable camera controls.
         self.safe_zone_ratio = float(cfg.get("safe_zone_ratio", 0.24))
-        self.pan_time_constant = float(cfg.get("pan_time_constant", 0.62))
-        self.player_pan_time_constant = float(cfg.get("player_pan_time_constant", 0.82))
-        self.recenter_time_constant = float(cfg.get("recenter_time_constant", 1.60))
-        self.max_pan_speed_ratio = float(cfg.get("max_pan_speed_ratio", 0.72))
+        self.prediction_safe_zone_ratio = float(cfg.get("prediction_safe_zone_ratio", 0.20))
+        self.pan_time_constant = float(cfg.get("pan_time_constant", 0.72))
+        self.prediction_pan_time_constant = float(cfg.get("prediction_pan_time_constant", 0.82))
+        self.player_pan_time_constant = float(cfg.get("player_pan_time_constant", 0.92))
+        self.recenter_time_constant = float(cfg.get("recenter_time_constant", 1.80))
+        self.max_pan_speed_ratio = float(cfg.get("max_pan_speed_ratio", 0.62))
         self.ball_min_confidence = float(cfg.get("ball_min_confidence", 0.28))
-        self.ball_hold_seconds = float(cfg.get("ball_hold_seconds", 0.20))
+        self.ball_hold_seconds = float(cfg.get("ball_hold_seconds", 0.18))
+
+        # Trajectory guidance is intentionally directional rather than exact.
+        self.prediction_min_confidence = float(cfg.get("prediction_min_confidence", 0.38))
+        self.prediction_lead_weight = float(cfg.get("prediction_lead_weight", 0.70))
+        trajectory_cfg = dict(cfg.get("trajectory", {}) or {})
+        self.trajectory = BallTrajectoryPredictor(
+            frame_size=(self.frame_w, self.frame_h),
+            fps=self.fps,
+            court_polygon=court_polygon,
+            cfg=trajectory_cfg,
+        )
+        self.prediction = TrajectoryPrediction()
 
         self.player_motion_weight = float(cfg.get("player_motion_weight", 4.0))
         self.sticky_bonus = float(cfg.get("sticky_bonus", 0.9))
@@ -150,6 +172,15 @@ class SmartPortraitReframer:
         frame_index: int,
         found: bool = True,
     ):
+        # Always update prediction state so its hold/staleness logic advances
+        # even when the classical tracker temporarily loses the ball.
+        self.prediction = self.trajectory.update(
+            point=point,
+            observation_confidence=float(confidence),
+            frame_index=int(frame_index),
+            found=bool(found),
+        )
+
         if point is None:
             return
         if found and confidence >= self.ball_min_confidence:
@@ -203,11 +234,12 @@ class SmartPortraitReframer:
         hold_frames = max(1, int(round(self.ball_hold_seconds * self.fps)))
         return self.ball_point is not None and frame_index - self.ball_last_seen_frame <= hold_frames
 
-    def _safe_zone_target(self, target_x: float) -> float:
+    def _safe_zone_target(self, target_x: float, ratio: Optional[float] = None) -> float:
         """Move only enough to keep target inside a broad horizontal safe-zone."""
         crop_w = self.crop_h * self.aspect
         half_w = 0.5 * crop_w
-        margin = float(np.clip(self.safe_zone_ratio, 0.10, 0.42)) * crop_w
+        chosen_ratio = self.safe_zone_ratio if ratio is None else float(ratio)
+        margin = float(np.clip(chosen_ratio, 0.10, 0.42)) * crop_w
         left_safe = self.center_x - half_w + margin
         right_safe = self.center_x + half_w - margin
 
@@ -217,13 +249,31 @@ class SmartPortraitReframer:
             return target_x - half_w + margin
         return self.center_x
 
+    def _prediction_target_x(self) -> Optional[float]:
+        pred = self.prediction
+        if not pred.valid or pred.point is None or pred.confidence < self.prediction_min_confidence:
+            return None
+
+        predicted_x = float(pred.point[0])
+        if self.ball_point is not None:
+            current_x = float(self.ball_point[0])
+            lead = float(np.clip(self.prediction_lead_weight, 0.0, 1.0))
+            predicted_x = current_x + lead * (predicted_x - current_x)
+        return predicted_x
+
     def _desired_center_x(self, frame_index: int) -> tuple[float, str, Optional[int]]:
         fallback_x, _ = self._fallback_center()
         player_x, target_id = self._player_anchor_x(frame_index)
 
+        prediction_x = self._prediction_target_x()
+        if prediction_x is not None:
+            zone = self.prediction.zone if self.prediction.zone else "?"
+            # Prediction uses a slightly larger safe zone: anticipate direction,
+            # but do not swing the camera unless composition really needs it.
+            desired = self._safe_zone_target(prediction_x, self.prediction_safe_zone_ratio)
+            return float(desired), f"PRED-{zone}", target_id
+
         if self._ball_is_fresh(frame_index):
-            # The ball only nudges the frame when it approaches an edge. It no
-            # longer becomes the exact camera centre every frame.
             return float(self._safe_zone_target(float(self.ball_point[0]))), "BALL", target_id
 
         if target_id is not None:
@@ -235,15 +285,18 @@ class SmartPortraitReframer:
         if abs(error) < 0.75:
             return
 
-        if mode == "BALL":
+        if mode.startswith("PRED-"):
+            tau = self.prediction_pan_time_constant
+            speed_scale = 0.88
+        elif mode == "BALL":
             tau = self.pan_time_constant
-            speed_scale = 1.0
+            speed_scale = 0.82
         elif mode == "PLAYER":
             tau = self.player_pan_time_constant
-            speed_scale = 0.75
+            speed_scale = 0.68
         else:
             tau = self.recenter_time_constant
-            speed_scale = 0.45
+            speed_scale = 0.40
 
         dt = 1.0 / max(1.0, self.fps)
         alpha = 1.0 - math.exp(-dt / max(0.05, tau))
@@ -272,8 +325,8 @@ class SmartPortraitReframer:
         return x1, y1, x2, y2
 
     def render(self, frame, frame_index: int):
-        # Fixed zoom and fixed vertical composition. Only horizontal panning is
-        # allowed, and even that only when action nears the portrait edge.
+        # Fixed zoom and fixed vertical composition. Prediction only affects the
+        # horizontal camera target, and even that is constrained by a safe zone.
         self.crop_h = self._fixed_crop_height()
         _, fixed_y = self._fallback_center()
         self.center_y = fixed_y
@@ -289,7 +342,16 @@ class SmartPortraitReframer:
             portrait = cv2.resize(crop, (self.output_w, self.output_h), interpolation=cv2.INTER_LINEAR)
 
         ball = None if self.ball_point is None else tuple(map(float, self.ball_point))
-        self.last_focus = FocusInfo(target_id, (x1, y1, x2, y2), mode, ball)
+        predicted = self.prediction.point if self.prediction.valid else None
+        self.last_focus = FocusInfo(
+            target_id,
+            (x1, y1, x2, y2),
+            mode,
+            ball,
+            predicted,
+            self.prediction.zone,
+            self.prediction.confidence,
+        )
         return portrait
 
     def draw_source_crop(self, frame, color=(255, 120, 255)):
@@ -307,6 +369,24 @@ class SmartPortraitReframer:
             cv2.LINE_AA,
         )
 
-        if self.last_focus.ball_point is not None and self.last_focus.mode == "BALL":
-            bx, by = map(int, self.last_focus.ball_point)
-            cv2.circle(frame, (bx, by), 8, (0, 255, 255), 2, cv2.LINE_AA)
+        ball_xy = None
+        if self.last_focus.ball_point is not None:
+            ball_xy = tuple(map(int, self.last_focus.ball_point))
+            cv2.circle(frame, ball_xy, 7, (0, 255, 255), 2, cv2.LINE_AA)
+
+        if self.last_focus.predicted_point is not None:
+            pred_xy = tuple(map(int, self.last_focus.predicted_point))
+            if ball_xy is not None:
+                cv2.arrowedLine(frame, ball_xy, pred_xy, (255, 0, 255), 2, cv2.LINE_AA, tipLength=0.12)
+            cv2.circle(frame, pred_xy, 9, (255, 0, 255), 2, cv2.LINE_AA)
+            text = f"{self.last_focus.predicted_zone} {self.last_focus.prediction_confidence:.0%}"
+            cv2.putText(
+                frame,
+                text,
+                (pred_xy[0] + 8, max(20, pred_xy[1] - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (255, 0, 255),
+                1,
+                cv2.LINE_AA,
+            )

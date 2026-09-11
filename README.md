@@ -1,102 +1,85 @@
-# Padel Auto-Highlight POC v0.6
+# Padel Auto-Highlight POC v0.10
 
 Edge POC:
 
-`Camera / RTSP / video -> dual-view pose + tracking -> court geometry -> serve state machine -> ball-guided smart portrait reframe -> automatic MP4 clip`
+`Camera / RTSP / video -> dual-view pose + tracking -> court geometry -> serve state machine -> ball tracking -> short-horizon trajectory prediction -> stable 9:16 portrait highlight -> MP4`
 
-## v0.6: ball-guided composition, not ball-chasing
+## v0.10: predict direction before the portrait camera moves
 
-The portrait output now follows the **direction of play / ball**, but deliberately does **not** keep the ball glued to the exact center of the frame.
+The portrait camera no longer reacts only to the ball's current pixel. Recent ball observations are mapped through the calibrated court homography into a canonical 10 m x 20 m padel court. The POC estimates the new motion vector and predicts roughly **0.3 s ahead**.
 
-The target behavior is closer to a human camera operator:
+The prediction is intentionally simple and useful for camera direction:
 
-- 9:16 portrait output;
-- mostly fixed zoom so the court composition stays readable;
-- vertical framing stays almost fixed;
-- ball primarily guides **left/right panning**;
-- a central ball safe-zone prevents tiny ball movements from moving the camera;
-- camera pan speed is capped, so a fast ball cannot make the crop whip across the frame;
-- ball guidance is blended with player positions to keep useful action context;
-- when the ball is briefly lost, the frame holds and then falls back to player/court composition;
-- detected server/player is a fallback, not the primary portrait target.
+- `LEFT`
+- `CENTER`
+- `RIGHT`
 
-The built-in ball tracker is a lightweight classical-CV POC using yellow/green colour, motion, temporal proximity, and the calibrated playable-court mask. It is intentionally replaceable later by a learned ball detector.
+The source preview shows:
 
-### Portrait defaults
+- a yellow circle = current ball estimate;
+- a magenta circle = predicted short-horizon position;
+- a magenta arrow = current -> predicted direction;
+- label such as `LEFT 74%` = predicted court side and confidence.
 
-You do not need to change `config.yaml`; these defaults are built into the code. To tune them, add:
+When a sharp trajectory change is observed, the predictor drops the old history and restarts on the new direction. This is intended to react quickly after a **serve, smash, volley, wall contact, or bounce** instead of averaging the old and new paths.
+
+Important: this is currently **post-impact trajectory prediction**, not true pre-impact intent prediction. It needs a few observed positions after the ball changes direction. That is enough to make the virtual camera anticipate the next area of play without requiring a trained shot-intent model yet.
+
+### Trajectory tuning
+
+Defaults are built into the code. Optional overrides:
 
 ```yaml
 portrait_output:
-  enabled: true
-  save_landscape: true
-  width: 1080
-  height: 1920
-  show_preview: true
-  show_source_crop: true
+  # Keep framing broad and stable.
+  crop_height_ratio: 1.0
+  safe_zone_ratio: 0.24
+  prediction_safe_zone_ratio: 0.20
 
-  # Keep zoom broad and stable, similar to the reference Shorts framing.
-  crop_height_ratio: 0.92
+  # Camera motion remains intentionally slow/eased.
+  pan_time_constant: 0.72
+  prediction_pan_time_constant: 0.82
+  player_pan_time_constant: 0.92
+  recenter_time_constant: 1.80
+  max_pan_speed_ratio: 0.62
 
-  # Ball may move inside this central horizontal zone without moving camera.
-  ball_safezone_ratio: 0.20
+  # How far toward the predicted point the director looks.
+  prediction_lead_weight: 0.70
+  prediction_min_confidence: 0.38
 
-  # How strongly the ball influences horizontal framing vs player context.
-  ball_weight: 0.78
-
-  # Smooth pan and hard cap on pan velocity.
-  pan_smoothing: 0.18
-  max_pan_speed_ratio: 0.85
-
-  # Keep using the last ball position briefly through detector misses.
-  ball_hold_seconds: 0.55
-
-  # Slow return to player/court composition when ball is lost.
-  recenter_smoothing: 0.05
+  trajectory:
+    horizon_seconds: 0.32
+    max_history: 8
+    min_points: 3
+    min_span_seconds: 0.055
+    min_speed_mps: 1.2
+    max_speed_mps: 55.0
+    reset_angle_deg: 52.0
+    reset_speed_ratio: 2.8
+    hold_seconds: 0.20
+    min_confidence: 0.30
 ```
 
-If the camera still feels too reactive:
+If portrait movement still feels too active, increase `prediction_safe_zone_ratio` to `0.24` or `prediction_pan_time_constant` to `1.0`.
+
+## Normal-speed highlight output
+
+Output is a highlight clip, **not a speed ramp**. Recorder defaults preserve source playback speed. A 59.94 fps source remains normal-time unless you intentionally configure another workflow.
 
 ```yaml
-ball_safezone_ratio: 0.25
-pan_smoothing: 0.12
-max_pan_speed_ratio: 0.60
+recorder:
+  preserve_source_speed: true
+  pre_roll_seconds: 3.0
+  post_roll_seconds: 7.0
+  min_clip_seconds: 5.0
+  max_clip_seconds: 15.0
 ```
 
-If it feels too slow:
+## Far-side player detection
 
-```yaml
-ball_safezone_ratio: 0.16
-pan_smoothing: 0.24
-max_pan_speed_ratio: 1.10
-```
+The camera view is split into independent near/far AI crops. Each side keeps its own YOLO Pose + ByteTrack state, with the far court using a lower detection threshold and larger inference input.
 
-### Optional ball-tracker tuning
-
-```yaml
-ball_tracking:
-  enabled: true
-  hsv_lower: [18, 70, 105]
-  hsv_upper: [48, 255, 255]
-  motion_threshold: 14
-  min_area: 3
-  max_area: 220
-  max_radius: 14
-  min_confidence: 0.28
-```
-
-If the court/video uses a different ball colour or lighting, this HSV range is the first thing to tune.
-
-## v0.4: better far-side player detection
-
-The camera view is split into two independent AI crops:
-
-- **near half court**
-- **far half court**
-
-Each half uses its own YOLO pose instance + ByteTrack state. The far half uses a lower detection threshold and larger inference size so distant players occupy more of the AI input.
-
-Built-in defaults can be overridden under `tracking:`:
+Optional overrides:
 
 ```yaml
 tracking:
@@ -109,25 +92,9 @@ tracking:
   far_imgsz: 1024
 ```
 
-If far players are still missed:
-
-```yaml
-far_conf: 0.15
-far_imgsz: 1280
-```
-
-If the Mac becomes too slow:
-
-```yaml
-frame_stride: 3
-far_imgsz: 960
-```
-
 ## Court geometry
 
-The POC uses one **4-point playable-court polygon** and generates all four serve zones using perspective geometry.
-
-Calibrate for every new camera angle:
+Calibrate once for every fixed camera angle:
 
 ```bash
 python tools/calibrate_zones.py --source padel.mp4 --seek 0
@@ -140,7 +107,7 @@ Click in this exact order:
 3. near-right back corner
 4. near-left back corner
 
-Press **Enter/Space** to save, **R** to reset, or **Q/Esc** to cancel.
+The same homography is now used both for perspective service zones and trajectory prediction.
 
 ## Install
 
@@ -161,13 +128,13 @@ Outputs:
 
 ```text
 clips/                 original landscape highlights
-clips/portrait/        9:16 ball-guided portrait highlights
+clips/portrait/        9:16 portrait highlights
 ```
 
-## Serve detector sequence
+## Current serve detector
 
-The heuristic temporal state machine is:
+The heuristic sequence remains:
 
 `IN_ZONE -> PREPARING -> SWING -> MOVE TOWARD NET -> SERVE`
 
-A player must also have their feet inside the playable court and inside a perspective service polygon before entering the serve sequence.
+The next major ML upgrade would be a learned ball detector / shot classifier, while keeping the same trajectory-director and recorder pipeline.

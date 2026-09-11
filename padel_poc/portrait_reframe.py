@@ -16,13 +16,12 @@ class FocusInfo:
 
 
 class SmartPortraitReframer:
-    """Composition-aware 9:16 virtual camera.
+    """9:16 virtual camera guided primarily by the tracked ball.
 
-    The ball guides horizontal panning, but the camera deliberately does not
-    chase every ball movement. The crop keeps a mostly fixed zoom and vertical
-    composition, uses a central safe zone, limits pan speed, and blends the
-    ball cue with player/court context. Player tracking is a fallback when the
-    ball is temporarily lost.
+    v0.7 makes ball guidance authoritative while the ball is fresh. Players are
+    fallback/composition context only. The camera uses a small dead-zone and a
+    distance-aware pan rate so a ball crossing to the left/right actually pulls
+    the portrait crop with it without frame-to-frame jitter.
     """
 
     STATE_SCORES = {
@@ -48,16 +47,17 @@ class SmartPortraitReframer:
         self.output_h = max(320, int(cfg.get("height", 1920)))
         self.aspect = self.output_w / self.output_h
 
-        # Reference-like framing: mostly fixed zoom, nearly fixed vertical axis.
         self.crop_height_ratio = float(cfg.get("crop_height_ratio", 0.92))
         self.vertical_bias = float(cfg.get("vertical_bias", 0.02))
-        self.pan_smoothing = float(cfg.get("pan_smoothing", 0.18))
-        self.max_pan_speed_ratio = float(cfg.get("max_pan_speed_ratio", 0.85))
-        self.ball_safezone_ratio = float(cfg.get("ball_safezone_ratio", 0.20))
-        self.ball_weight = float(cfg.get("ball_weight", 0.78))
-        self.ball_min_confidence = float(cfg.get("ball_min_confidence", 0.25))
-        self.ball_hold_seconds = float(cfg.get("ball_hold_seconds", 0.55))
-        self.recenter_smoothing = float(cfg.get("recenter_smoothing", 0.05))
+
+        # Faster horizontal catch-up than v0.6, but still smoothed.
+        self.pan_smoothing = float(cfg.get("pan_smoothing", 0.34))
+        self.max_pan_speed_ratio = float(cfg.get("max_pan_speed_ratio", 1.80))
+        self.ball_safezone_ratio = float(cfg.get("ball_safezone_ratio", 0.10))
+        self.ball_weight = float(cfg.get("ball_weight", 0.96))
+        self.ball_min_confidence = float(cfg.get("ball_min_confidence", 0.24))
+        self.ball_hold_seconds = float(cfg.get("ball_hold_seconds", 0.18))
+        self.recenter_smoothing = float(cfg.get("recenter_smoothing", 0.045))
         self.sticky_bonus = float(cfg.get("sticky_bonus", 1.25))
         self.lock_seconds = float(cfg.get("lock_seconds", 2.0))
 
@@ -117,7 +117,6 @@ class SmartPortraitReframer:
             self.ball_last_seen_frame = int(frame_index)
 
     def lock_target(self, track_id: int, frame_index: int, seconds: Optional[float] = None):
-        # Player lock is only a fallback if ball tracking is unavailable.
         self.locked_target = int(track_id)
         duration = self.lock_seconds if seconds is None else float(seconds)
         self.lock_until_frame = int(frame_index + max(1.0, duration * self.fps))
@@ -154,8 +153,7 @@ class SmartPortraitReframer:
         if not self.tracks:
             return self._fallback_center()[0], target_id
 
-        centers = []
-        weights = []
+        centers, weights = [], []
         for track_id, (bbox, status) in self.tracks.items():
             x1, _, x2, _ = map(float, bbox)
             centers.append(0.5 * (x1 + x2))
@@ -177,13 +175,14 @@ class SmartPortraitReframer:
 
         if self._ball_is_fresh(frame_index):
             ball_x = float(self.ball_point[0])
-            safe = max(20.0, self.ball_safezone_ratio * crop_w)
+            safe = max(16.0, self.ball_safezone_ratio * crop_w)
             delta = ball_x - self.center_x
 
-            # Do not move while the ball stays in the central composition zone.
             if abs(delta) <= safe:
                 ball_guided_x = self.center_x
             else:
+                # Keep the ball just inside the safe-zone edge rather than
+                # centering on every small movement.
                 ball_guided_x = ball_x - np.sign(delta) * safe
 
             weight = float(np.clip(self.ball_weight, 0.0, 1.0))
@@ -196,32 +195,42 @@ class SmartPortraitReframer:
 
     def _smooth_pan(self, desired_x: float, mode: str):
         crop_w = self.crop_h * self.aspect
-        alpha = self.pan_smoothing if mode == "BALL" else self.recenter_smoothing
-        raw_step = alpha * (desired_x - self.center_x)
-        max_step = max(2.0, self.max_pan_speed_ratio * crop_w / max(1.0, self.fps))
+        error = desired_x - self.center_x
+
+        if mode == "BALL":
+            # The further the ball is from the portrait centre, the stronger
+            # the catch-up. This fixes the previous case where the ball went
+            # left but the crop visually stayed near the middle.
+            distance_ratio = min(1.0, abs(error) / max(1.0, crop_w * 0.55))
+            alpha = self.pan_smoothing * (1.0 + 0.85 * distance_ratio)
+            speed_multiplier = 1.0 + 0.75 * distance_ratio
+        else:
+            alpha = self.recenter_smoothing
+            speed_multiplier = 0.55
+
+        raw_step = alpha * error
+        max_step = max(
+            2.0,
+            speed_multiplier * self.max_pan_speed_ratio * crop_w / max(1.0, self.fps),
+        )
         self.center_x += float(np.clip(raw_step, -max_step, max_step))
 
     def _crop_rect(self) -> tuple[int, int, int, int]:
         crop_h = min(self.crop_h, self._max_valid_crop_height())
         crop_w = crop_h * self.aspect
-        half_w = crop_w * 0.5
-        half_h = crop_h * 0.5
+        half_w, half_h = crop_w * 0.5, crop_h * 0.5
 
         cx = float(np.clip(self.center_x, half_w, self.frame_w - half_w))
         cy = float(np.clip(self.center_y, half_h, self.frame_h - half_h))
 
-        x1 = int(round(cx - half_w))
-        x2 = int(round(cx + half_w))
-        y1 = int(round(cy - half_h))
-        y2 = int(round(cy + half_h))
-        x1 = max(0, min(self.frame_w - 2, x1))
-        y1 = max(0, min(self.frame_h - 2, y1))
-        x2 = max(x1 + 2, min(self.frame_w, x2))
-        y2 = max(y1 + 2, min(self.frame_h, y2))
+        x1 = int(round(cx - half_w)); x2 = int(round(cx + half_w))
+        y1 = int(round(cy - half_h)); y2 = int(round(cy + half_h))
+        x1 = max(0, min(self.frame_w - 2, x1)); y1 = max(0, min(self.frame_h - 2, y1))
+        x2 = max(x1 + 2, min(self.frame_w, x2)); y2 = max(y1 + 2, min(self.frame_h, y2))
         return x1, y1, x2, y2
 
     def render(self, frame, frame_index: int):
-        self.crop_h = self._fixed_crop_height()  # intentionally stable; no wild zoom.
+        self.crop_h = self._fixed_crop_height()
         _, fixed_y = self._fallback_center()
         self.center_y = fixed_y
 

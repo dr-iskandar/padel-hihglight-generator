@@ -19,12 +19,12 @@ class ActiveClip:
 
 
 class ClipRecorder:
-    """Buffered clip recorder that preserves source playback speed by default.
+    """Buffered highlight recorder.
 
-    `fps` is always the source-video FPS. Unless `output_fps` is explicitly set
-    in config, the output uses the exact source FPS and writes every source
-    frame. This keeps highlights at normal speed; the system trims moments, it
-    does not speed them up.
+    Normal-speed playback is the default and wins even if an old local config
+    still contains `output_fps: 30`. The system's job is to select a highlight,
+    not accelerate it. Set `preserve_source_speed: false` only when an explicit
+    frame-rate conversion is really desired.
     """
 
     def __init__(self, output_dir: str, fps: float, frame_size, cfg: dict):
@@ -32,8 +32,13 @@ class ClipRecorder:
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         self.fps = float(fps)
-        requested_output_fps = float(cfg.get("output_fps", self.fps))
-        self.output_fps = max(1.0, min(self.fps, requested_output_fps))
+        self.preserve_source_speed = bool(cfg.get("preserve_source_speed", True))
+        if self.preserve_source_speed:
+            self.output_fps = self.fps
+        else:
+            requested_output_fps = float(cfg.get("output_fps", self.fps))
+            self.output_fps = max(1.0, min(self.fps, requested_output_fps))
+
         self.frame_size = tuple(map(int, frame_size))
         self.pre_frames = max(1, int(float(cfg.get("pre_roll_seconds", 3.0)) * self.fps))
         self.post_frames = max(1, int(float(cfg.get("post_roll_seconds", 7.0)) * self.fps))
@@ -54,14 +59,11 @@ class ClipRecorder:
         if self.active is None:
             return
 
-        # Exact-source-FPS mode: write every frame. This is the default and is
-        # intentionally the safest mode for highlight clips.
-        if abs(self.output_fps - self.fps) < 1e-3:
+        if self.preserve_source_speed or abs(self.output_fps - self.fps) < 1e-3:
             self.active.writer.write(frame)
             self.active.last_output_slot += 1
             return
 
-        # Optional downsampling still preserves real-world duration.
         slot = self._output_slot(frame_index, self.active.start_frame)
         if slot <= self.active.last_output_slot:
             return

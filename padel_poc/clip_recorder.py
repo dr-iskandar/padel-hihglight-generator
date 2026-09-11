@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+import math
 import cv2
 
 
@@ -14,30 +15,56 @@ class ActiveClip:
     start_frame: int
     end_frame: int
     hard_end_frame: int
+    last_output_slot: int = -1
 
 
 class ClipRecorder:
+    """Buffered clip recorder with optional output-FPS resampling.
+
+    `fps` is always the source-video FPS. `cfg.output_fps` controls the encoded
+    output FPS. When output_fps is lower than source FPS, frames are sampled by
+    source timestamps so clip duration stays correct instead of playing fast.
+    """
+
     def __init__(self, output_dir: str, fps: float, frame_size, cfg: dict):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         self.fps = float(fps)
+        requested_output_fps = float(cfg.get("output_fps", self.fps))
+        # This POC only needs down-sampling. Capping avoids accidental speed-up
+        # or fake frame duplication when someone asks for a higher output FPS.
+        self.output_fps = max(1.0, min(self.fps, requested_output_fps))
         self.frame_size = tuple(map(int, frame_size))
-        self.pre_frames = max(1, int(float(cfg.get("pre_roll_seconds", 3.0)) * fps))
-        self.post_frames = max(1, int(float(cfg.get("post_roll_seconds", 7.0)) * fps))
-        self.min_frames = max(1, int(float(cfg.get("min_clip_seconds", 5.0)) * fps))
-        self.max_frames = max(self.min_frames, int(float(cfg.get("max_clip_seconds", 15.0)) * fps))
+        self.pre_frames = max(1, int(float(cfg.get("pre_roll_seconds", 3.0)) * self.fps))
+        self.post_frames = max(1, int(float(cfg.get("post_roll_seconds", 7.0)) * self.fps))
+        self.min_frames = max(1, int(float(cfg.get("min_clip_seconds", 5.0)) * self.fps))
+        self.max_frames = max(self.min_frames, int(float(cfg.get("max_clip_seconds", 15.0)) * self.fps))
         self.codec = str(cfg.get("codec", "mp4v"))
 
         self.buffer = deque(maxlen=self.pre_frames)
         self.active: Optional[ActiveClip] = None
         self.last_saved: Optional[Path] = None
 
+    def _output_slot(self, source_frame_index: int, start_frame: int) -> int:
+        elapsed_source_frames = max(0, int(source_frame_index) - int(start_frame))
+        elapsed_seconds = elapsed_source_frames / max(1e-6, self.fps)
+        return int(math.floor(elapsed_seconds * self.output_fps + 1e-9))
+
+    def _write_sampled(self, frame, frame_index: int):
+        if self.active is None:
+            return
+        slot = self._output_slot(frame_index, self.active.start_frame)
+        if slot <= self.active.last_output_slot:
+            return
+        self.active.writer.write(frame)
+        self.active.last_output_slot = slot
+
     def push(self, frame, frame_index: int):
         self.buffer.append((frame_index, frame.copy()))
 
         if self.active is not None:
-            self.active.writer.write(frame)
+            self._write_sampled(frame, frame_index)
             if frame_index >= self.active.end_frame or frame_index >= self.active.hard_end_frame:
                 self._finish()
 
@@ -50,7 +77,7 @@ class ClipRecorder:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
         path = self.output_dir / f"{timestamp}_{label}.mp4"
         fourcc = cv2.VideoWriter_fourcc(*self.codec)
-        writer = cv2.VideoWriter(str(path), fourcc, self.fps, self.frame_size)
+        writer = cv2.VideoWriter(str(path), fourcc, self.output_fps, self.frame_size)
         if not writer.isOpened():
             raise RuntimeError(f"Could not open VideoWriter for {path}")
 
@@ -60,10 +87,9 @@ class ClipRecorder:
         hard_end = start_frame + self.max_frames
         end_frame = min(hard_end, max(min_end, requested_end))
 
-        for _, buffered_frame in self.buffer:
-            writer.write(buffered_frame)
-
         self.active = ActiveClip(writer, path, start_frame, end_frame, hard_end)
+        for buffered_index, buffered_frame in self.buffer:
+            self._write_sampled(buffered_frame, buffered_index)
         return path
 
     def _finish(self):

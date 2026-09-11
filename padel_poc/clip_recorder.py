@@ -31,9 +31,9 @@ class ClipRecorder:
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         self.fps = float(fps)
-        requested_output_fps = float(cfg.get("output_fps", self.fps))
-        # This POC only needs down-sampling. Capping avoids accidental speed-up
-        # or fake frame duplication when someone asks for a higher output FPS.
+        # 30 fps is the default social-video output. We resample by source time,
+        # so a 59.94 fps input still keeps exactly the same real-world duration.
+        requested_output_fps = float(cfg.get("output_fps", min(self.fps, 30.0)))
         self.output_fps = max(1.0, min(self.fps, requested_output_fps))
         self.frame_size = tuple(map(int, frame_size))
         self.pre_frames = max(1, int(float(cfg.get("pre_roll_seconds", 3.0)) * self.fps))

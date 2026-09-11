@@ -22,17 +22,18 @@ class FocusInfo:
 
 
 class SmartPortraitReframer:
-    """Stable 9:16 virtual camera for padel highlights.
+    """9:16 virtual camera with anticipatory panning and edge protection.
 
-    v0.10 adds a short-horizon trajectory director. The portrait crop does not
-    chase every ball pixel. Instead, recent ball movement is projected into the
-    calibrated court, a LEFT/CENTER/RIGHT destination is predicted ~0.3 s ahead,
-    and the camera begins a slow glide only when that predicted action would
-    approach the portrait edge.
+    v0.11 fixes two problems seen in real POC output:
+      * the portrait camera started moving too late and lagged behind rallies;
+      * players near the left/right glass could be cut off even though their
+        centre point was still technically inside the crop.
 
-    This keeps the sports-highlight feel while still anticipating a serve,
-    smash, volley, rebound, or other clear direction change after the ball has
-    started moving on its new trajectory.
+    The director now starts panning from the trajectory prediction earlier,
+    treats the active player's *whole bounding box* as a composition constraint,
+    and enters a faster catch-up mode only when action is at real risk of being
+    clipped. This gives earlier movement without returning to frame-by-frame
+    ball chasing.
     """
 
     STATE_SCORES = {
@@ -58,25 +59,37 @@ class SmartPortraitReframer:
         self.output_h = max(320, int(cfg.get("height", 1920)))
         self.aspect = self.output_w / self.output_h
 
-        # Wide, fixed 9:16 crop. No dynamic zoom while rally is active.
+        # Keep maximum available width for a 9:16 crop. No zoom pumping.
         self.crop_height_ratio = float(cfg.get("crop_height_ratio", 1.0))
         self.vertical_bias = float(cfg.get("vertical_bias", 0.015))
 
-        # Stable camera controls.
-        self.safe_zone_ratio = float(cfg.get("safe_zone_ratio", 0.24))
-        self.prediction_safe_zone_ratio = float(cfg.get("prediction_safe_zone_ratio", 0.20))
-        self.pan_time_constant = float(cfg.get("pan_time_constant", 0.72))
-        self.prediction_pan_time_constant = float(cfg.get("prediction_pan_time_constant", 0.82))
-        self.player_pan_time_constant = float(cfg.get("player_pan_time_constant", 0.92))
-        self.recenter_time_constant = float(cfg.get("recenter_time_constant", 1.80))
-        self.max_pan_speed_ratio = float(cfg.get("max_pan_speed_ratio", 0.62))
-        self.ball_min_confidence = float(cfg.get("ball_min_confidence", 0.28))
-        self.ball_hold_seconds = float(cfg.get("ball_hold_seconds", 0.18))
+        # Start moving BEFORE action reaches the portrait edge.
+        self.safe_zone_ratio = float(cfg.get("safe_zone_ratio", 0.27))
+        self.prediction_safe_zone_ratio = float(cfg.get("prediction_safe_zone_ratio", 0.32))
+        self.player_edge_guard_ratio = float(cfg.get("player_edge_guard_ratio", 0.11))
+        self.emergency_edge_ratio = float(cfg.get("emergency_edge_ratio", 0.055))
 
-        # Trajectory guidance is intentionally directional rather than exact.
-        self.prediction_min_confidence = float(cfg.get("prediction_min_confidence", 0.38))
-        self.prediction_lead_weight = float(cfg.get("prediction_lead_weight", 0.70))
+        # Normal pans are smooth; emergency catch-up is only used when clipping
+        # is imminent. Lower time constant = earlier/faster response.
+        self.pan_time_constant = float(cfg.get("pan_time_constant", 0.46))
+        self.prediction_pan_time_constant = float(cfg.get("prediction_pan_time_constant", 0.32))
+        self.player_pan_time_constant = float(cfg.get("player_pan_time_constant", 0.56))
+        self.recenter_time_constant = float(cfg.get("recenter_time_constant", 1.85))
+        self.max_pan_speed_ratio = float(cfg.get("max_pan_speed_ratio", 1.15))
+        self.emergency_pan_speed_ratio = float(cfg.get("emergency_pan_speed_ratio", 2.10))
+        self.emergency_time_constant = float(cfg.get("emergency_time_constant", 0.16))
+
+        self.ball_min_confidence = float(cfg.get("ball_min_confidence", 0.28))
+        self.ball_hold_seconds = float(cfg.get("ball_hold_seconds", 0.16))
+
+        # Trajectory cue: longer and stronger look-ahead than v0.10 so the crop
+        # is already travelling before the ball reaches the outside third.
+        self.prediction_min_confidence = float(cfg.get("prediction_min_confidence", 0.34))
+        self.prediction_lead_weight = float(cfg.get("prediction_lead_weight", 0.95))
         trajectory_cfg = dict(cfg.get("trajectory", {}) or {})
+        trajectory_cfg.setdefault("horizon_seconds", 0.46)
+        trajectory_cfg.setdefault("hold_seconds", 0.18)
+        trajectory_cfg.setdefault("min_confidence", 0.28)
         self.trajectory = BallTrajectoryPredictor(
             frame_size=(self.frame_w, self.frame_h),
             fps=self.fps,
@@ -85,10 +98,10 @@ class SmartPortraitReframer:
         )
         self.prediction = TrajectoryPrediction()
 
-        self.player_motion_weight = float(cfg.get("player_motion_weight", 4.0))
-        self.sticky_bonus = float(cfg.get("sticky_bonus", 0.9))
-        self.max_fallback_lock_seconds = float(cfg.get("max_fallback_lock_seconds", 0.35))
-        self.lock_seconds = float(cfg.get("lock_seconds", 0.35))
+        self.player_motion_weight = float(cfg.get("player_motion_weight", 4.5))
+        self.sticky_bonus = float(cfg.get("sticky_bonus", 0.8))
+        self.max_fallback_lock_seconds = float(cfg.get("max_fallback_lock_seconds", 0.28))
+        self.lock_seconds = float(cfg.get("lock_seconds", 0.28))
 
         self.court_polygon = court_polygon
         self.tracks: Dict[int, tuple[np.ndarray, object]] = {}
@@ -131,6 +144,9 @@ class SmartPortraitReframer:
         ratio = float(np.clip(self.crop_height_ratio, 0.80, 1.0))
         return min(self._max_valid_crop_height(), ratio * self.frame_h)
 
+    def _crop_width(self) -> float:
+        return float(self.crop_h * self.aspect)
+
     def update_tracks(self, track_ids, boxes, statuses: dict):
         previous_centers = self.track_centers
         new_tracks: Dict[int, tuple[np.ndarray, object]] = {}
@@ -155,7 +171,7 @@ class SmartPortraitReframer:
                 motion = min(3.0, displacement / bbox_h)
 
             old_motion = self.track_motion.get(track_id, 0.0)
-            motion = 0.78 * old_motion + 0.22 * motion
+            motion = 0.74 * old_motion + 0.26 * motion
 
             new_tracks[track_id] = (bbox, status)
             new_centers[track_id] = center
@@ -172,8 +188,6 @@ class SmartPortraitReframer:
         frame_index: int,
         found: bool = True,
     ):
-        # Always update prediction state so its hold/staleness logic advances
-        # even when the classical tracker temporarily loses the ball.
         self.prediction = self.trajectory.update(
             point=point,
             observation_confidence=float(confidence),
@@ -222,24 +236,22 @@ class SmartPortraitReframer:
         self.current_target = int(best_id)
         return self.current_target
 
-    def _player_anchor_x(self, frame_index: int) -> tuple[float, Optional[int]]:
+    def _active_player(self, frame_index: int):
         target_id = self._select_target(frame_index)
         if target_id is None or target_id not in self.tracks:
-            return self._fallback_center()[0], target_id
+            return None, None
         bbox, _ = self.tracks[target_id]
-        x1, _, x2, _ = map(float, bbox)
-        return 0.5 * (x1 + x2), target_id
+        return target_id, np.asarray(bbox, dtype=np.float32)
 
     def _ball_is_fresh(self, frame_index: int) -> bool:
         hold_frames = max(1, int(round(self.ball_hold_seconds * self.fps)))
         return self.ball_point is not None and frame_index - self.ball_last_seen_frame <= hold_frames
 
-    def _safe_zone_target(self, target_x: float, ratio: Optional[float] = None) -> float:
-        """Move only enough to keep target inside a broad horizontal safe-zone."""
-        crop_w = self.crop_h * self.aspect
+    def _point_safe_target(self, target_x: float, ratio: float) -> float:
+        """Desired camera centre that keeps a point away from crop edges."""
+        crop_w = self._crop_width()
         half_w = 0.5 * crop_w
-        chosen_ratio = self.safe_zone_ratio if ratio is None else float(ratio)
-        margin = float(np.clip(chosen_ratio, 0.10, 0.42)) * crop_w
+        margin = float(np.clip(ratio, 0.05, 0.42)) * crop_w
         left_safe = self.center_x - half_w + margin
         right_safe = self.center_x + half_w - margin
 
@@ -247,6 +259,28 @@ class SmartPortraitReframer:
             return target_x + half_w - margin
         if target_x > right_safe:
             return target_x - half_w + margin
+        return self.center_x
+
+    def _interval_safe_target(self, x1: float, x2: float, ratio: float) -> float:
+        """Move enough to keep an entire bbox/action interval visible."""
+        if x2 < x1:
+            x1, x2 = x2, x1
+        crop_w = self._crop_width()
+        half_w = 0.5 * crop_w
+        margin = float(np.clip(ratio, 0.03, 0.28)) * crop_w
+        inner_half = max(10.0, half_w - margin)
+
+        # If the requested interval is wider than the usable portrait interior,
+        # centre it rather than oscillating between both edges.
+        if (x2 - x1) >= 2.0 * inner_half:
+            return 0.5 * (x1 + x2)
+
+        min_center = x2 - inner_half
+        max_center = x1 + inner_half
+        if self.center_x < min_center:
+            return min_center
+        if self.center_x > max_center:
+            return max_center
         return self.center_x
 
     def _prediction_target_x(self) -> Optional[float]:
@@ -261,49 +295,98 @@ class SmartPortraitReframer:
             predicted_x = current_x + lead * (predicted_x - current_x)
         return predicted_x
 
-    def _desired_center_x(self, frame_index: int) -> tuple[float, str, Optional[int]]:
+    def _desired_center_x(self, frame_index: int) -> tuple[float, str, Optional[int], bool]:
         fallback_x, _ = self._fallback_center()
-        player_x, target_id = self._player_anchor_x(frame_index)
+        target_id, player_bbox = self._active_player(frame_index)
 
         prediction_x = self._prediction_target_x()
+        ball_x = float(self.ball_point[0]) if self._ball_is_fresh(frame_index) else None
+
+        # 1) Predicted trajectory leads the camera. If active player and ball are
+        # in the same local action region, keep the whole region inside portrait.
         if prediction_x is not None:
-            zone = self.prediction.zone if self.prediction.zone else "?"
-            # Prediction uses a slightly larger safe zone: anticipate direction,
-            # but do not swing the camera unless composition really needs it.
-            desired = self._safe_zone_target(prediction_x, self.prediction_safe_zone_ratio)
-            return float(desired), f"PRED-{zone}", target_id
+            desired = self._point_safe_target(prediction_x, self.prediction_safe_zone_ratio)
+            mode = f"PRED-{self.prediction.zone if self.prediction.zone else '?'}"
 
-        if self._ball_is_fresh(frame_index):
-            return float(self._safe_zone_target(float(self.ball_point[0]))), "BALL", target_id
+            if player_bbox is not None:
+                px1, _, px2, _ = map(float, player_bbox)
+                action_points = [px1, px2, prediction_x]
+                if ball_x is not None:
+                    action_points.append(ball_x)
+                action_min, action_max = min(action_points), max(action_points)
+                usable = self._crop_width() * (1.0 - 2.0 * self.player_edge_guard_ratio)
+                if action_max - action_min <= usable:
+                    desired = self._interval_safe_target(
+                        action_min, action_max, self.player_edge_guard_ratio
+                    )
 
-        if target_id is not None:
-            return float(self._safe_zone_target(player_x)), "PLAYER", target_id
-        return float(fallback_x), "COURT", target_id
+            return float(desired), mode, target_id, self._edge_risk(prediction_x, player_bbox)
 
-    def _ease_pan(self, desired_x: float, mode: str):
+        # 2) Fresh ball is next priority. Keep hitter visible too when possible.
+        if ball_x is not None:
+            desired = self._point_safe_target(ball_x, self.safe_zone_ratio)
+            if player_bbox is not None:
+                px1, _, px2, _ = map(float, player_bbox)
+                action_min, action_max = min(px1, ball_x), max(px2, ball_x)
+                usable = self._crop_width() * (1.0 - 2.0 * self.player_edge_guard_ratio)
+                if action_max - action_min <= usable:
+                    desired = self._interval_safe_target(
+                        action_min, action_max, self.player_edge_guard_ratio
+                    )
+            return float(desired), "BALL", target_id, self._edge_risk(ball_x, player_bbox)
+
+        # 3) If the ball is lost, protect the complete active player bbox. This
+        # specifically prevents players at the glass from being half cut off.
+        if player_bbox is not None:
+            px1, _, px2, _ = map(float, player_bbox)
+            desired = self._interval_safe_target(px1, px2, self.player_edge_guard_ratio)
+            return float(desired), "PLAYER", target_id, self._edge_risk(None, player_bbox)
+
+        return float(fallback_x), "COURT", target_id, False
+
+    def _edge_risk(self, point_x: Optional[float], player_bbox) -> bool:
+        """True only when action is close to or outside the current crop edge."""
+        crop_w = self._crop_width()
+        half_w = 0.5 * crop_w
+        margin = float(np.clip(self.emergency_edge_ratio, 0.02, 0.15)) * crop_w
+        left = self.center_x - half_w + margin
+        right = self.center_x + half_w - margin
+
+        if point_x is not None and (point_x < left or point_x > right):
+            return True
+        if player_bbox is not None:
+            px1, _, px2, _ = map(float, player_bbox)
+            if px1 < left or px2 > right:
+                return True
+        return False
+
+    def _ease_pan(self, desired_x: float, mode: str, emergency: bool = False):
         error = desired_x - self.center_x
         if abs(error) < 0.75:
             return
 
-        if mode.startswith("PRED-"):
+        if emergency:
+            tau = self.emergency_time_constant
+            speed_ratio = self.emergency_pan_speed_ratio
+        elif mode.startswith("PRED-"):
             tau = self.prediction_pan_time_constant
-            speed_scale = 0.88
+            speed_ratio = self.max_pan_speed_ratio
         elif mode == "BALL":
             tau = self.pan_time_constant
-            speed_scale = 0.82
+            speed_ratio = self.max_pan_speed_ratio * 0.92
         elif mode == "PLAYER":
             tau = self.player_pan_time_constant
-            speed_scale = 0.68
+            speed_ratio = self.max_pan_speed_ratio * 0.82
         else:
             tau = self.recenter_time_constant
-            speed_scale = 0.40
+            speed_ratio = self.max_pan_speed_ratio * 0.36
 
         dt = 1.0 / max(1.0, self.fps)
-        alpha = 1.0 - math.exp(-dt / max(0.05, tau))
+        alpha = 1.0 - math.exp(-dt / max(0.04, tau))
         raw_step = alpha * error
 
-        crop_w = self.crop_h * self.aspect
-        max_step = max(1.0, speed_scale * self.max_pan_speed_ratio * crop_w * dt)
+        crop_w = self._crop_width()
+        max_step = max(1.0, speed_ratio * crop_w * dt)
         self.center_x += float(np.clip(raw_step, -max_step, max_step))
 
     def _crop_rect(self) -> tuple[int, int, int, int]:
@@ -325,14 +408,12 @@ class SmartPortraitReframer:
         return x1, y1, x2, y2
 
     def render(self, frame, frame_index: int):
-        # Fixed zoom and fixed vertical composition. Prediction only affects the
-        # horizontal camera target, and even that is constrained by a safe zone.
         self.crop_h = self._fixed_crop_height()
         _, fixed_y = self._fallback_center()
         self.center_y = fixed_y
 
-        desired_x, mode, target_id = self._desired_center_x(frame_index)
-        self._ease_pan(desired_x, mode)
+        desired_x, mode, target_id, emergency = self._desired_center_x(frame_index)
+        self._ease_pan(desired_x, mode, emergency=emergency)
 
         x1, y1, x2, y2 = self._crop_rect()
         crop = frame[y1:y2, x1:x2]
@@ -343,10 +424,11 @@ class SmartPortraitReframer:
 
         ball = None if self.ball_point is None else tuple(map(float, self.ball_point))
         predicted = self.prediction.point if self.prediction.valid else None
+        effective_mode = f"{mode}!" if emergency else mode
         self.last_focus = FocusInfo(
             target_id,
             (x1, y1, x2, y2),
-            mode,
+            effective_mode,
             ball,
             predicted,
             self.prediction.zone,
@@ -377,7 +459,15 @@ class SmartPortraitReframer:
         if self.last_focus.predicted_point is not None:
             pred_xy = tuple(map(int, self.last_focus.predicted_point))
             if ball_xy is not None:
-                cv2.arrowedLine(frame, ball_xy, pred_xy, (255, 0, 255), 2, cv2.LINE_AA, tipLength=0.12)
+                cv2.arrowedLine(
+                    frame,
+                    ball_xy,
+                    pred_xy,
+                    (255, 0, 255),
+                    2,
+                    cv2.LINE_AA,
+                    tipLength=0.12,
+                )
             cv2.circle(frame, pred_xy, 9, (255, 0, 255), 2, cv2.LINE_AA)
             text = f"{self.last_focus.predicted_zone} {self.last_focus.prediction_confidence:.0%}"
             cv2.putText(
